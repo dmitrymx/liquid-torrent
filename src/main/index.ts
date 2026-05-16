@@ -125,20 +125,20 @@ function setupIPC(): void {
     try { engine.throttleTorrent(infoHash, downLimit, upLimit) } catch (e) { console.error('[IPC] throttle:', e) }
   })
 
-  ipcMain.handle('torrent:getAll', () => {
-    try { return engine.getAllTorrents() } catch { return [] }
+  ipcMain.handle('torrent:getAll', async () => {
+    try { return await engine.getAllTorrents() } catch { return [] }
   })
 
-  ipcMain.handle('torrent:getAllLight', () => {
-    try { return engine.getAllTorrentsLight() } catch { return [] }
+  ipcMain.handle('torrent:getAllLight', async () => {
+    try { return await engine.getAllTorrentsLight() } catch { return [] }
   })
 
-  ipcMain.handle('torrent:getFullInfo', (_e, infoHash: string) => {
-    try { return engine.getFullTorrentInfo(infoHash) } catch { return null }
+  ipcMain.handle('torrent:getFullInfo', async (_e, infoHash: string) => {
+    try { return await engine.getFullTorrentInfo(infoHash) } catch { return null }
   })
 
-  ipcMain.handle('torrent:getStats', () => {
-    try { return engine.getSessionStats() }
+  ipcMain.handle('torrent:getStats', async () => {
+    try { return await engine.getSessionStats() }
     catch { return { downloadRate: 0, uploadRate: 0, numPeers: 0, numTorrents: 0 } }
   })
 
@@ -146,8 +146,8 @@ function setupIPC(): void {
   ipcMain.handle('settings:get', () => {
     try { return engine.getSettings() } catch { return {} }
   })
-  ipcMain.handle('settings:save', (_e, settings: any) => {
-    try { engine.saveSettings(settings) } catch {}
+  ipcMain.handle('settings:save', async (_e, settings: any) => {
+    try { await engine.updateSettings(settings) } catch {}
   })
 
   // Dialog: open .torrent file

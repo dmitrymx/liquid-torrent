@@ -78,16 +78,26 @@ npm run dist:portable
 
 ```
 src/
-├── main/           # Electron Main Process
-│   ├── index.ts    # Window, IPC, Tray, file associations
-│   └── torrent.ts  # WebTorrent engine (кэширование, persistence)
+├── main/                # Electron Main Process
+│   ├── index.ts         # Window, IPC, Tray, file associations
+│   ├── torrent.ts       # Thin proxy → utilityProcess (15KB)
+│   └── torrent-worker.ts # WebTorrent engine (отдельный процесс!)
 ├── preload/
-│   └── index.ts    # Context bridge (IPC ↔ Renderer)
-└── renderer/       # React UI
-    ├── App.tsx     # Главный компонент + polling loop
-    ├── store/      # Zustand state management
-    ├── components/ # UI компоненты
-    └── styles/     # CSS (тёмная тема, анимации)
+│   └── index.ts         # Context bridge (IPC ↔ Renderer)
+└── renderer/            # React UI
+    ├── App.tsx          # Главный компонент + polling loop
+    ├── store/           # Zustand state management
+    ├── components/      # UI компоненты
+    └── styles/          # CSS (тёмная тема, анимации)
+```
+
+### Ключевое решение: utilityProcess
+
+```
+Renderer ←IPC→ Main Process (Window/IPC/Tray)
+                    ↓ postMessage (async)
+               UtilityProcess (WebTorrent Engine)
+               ↑ отдельный OS-процесс, не блокирует UI
 ```
 
 ### Оптимизации производительности (v1.3.0)

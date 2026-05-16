@@ -1,8 +1,9 @@
 /**
- * Liquid Torrent — WebTorrent Engine
- * Port of torrent_engine.py from PySide6 version to TypeScript/WebTorrent
- * Uses dynamic import() because webtorrent is ESM-only
+ * Liquid Torrent — TorrentEngine Proxy
+ * Thin proxy that communicates with the WebTorrent worker via utilityProcess.
+ * All CPU-heavy work runs in the worker process — main thread stays responsive.
  */
+import { utilityProcess } from 'electron'
 import { app } from 'electron'
 import * as path from 'path'
 import * as fs from 'fs'
@@ -23,8 +24,8 @@ export interface TorrentInfo {
   numSeeds: number
   eta: number
   savePath: string
-  files: { index: number; path: string; name: string; size: number; progress: number }[]
-  trackers: string[]
+  files?: { index: number; path: string; name: string; size: number; progress: number }[]
+  trackers?: string[]
   magnetURI: string
   infoHash: string
   ratio: number
@@ -41,8 +42,8 @@ export interface SessionStats {
 
 export interface EngineSettings {
   downloadDir: string
-  maxDownloadSpeed: number  // bytes/s, -1 = unlimited
-  maxUploadSpeed: number    // bytes/s, -1 = unlimited
+  maxDownloadSpeed: number
+  maxUploadSpeed: number
   maxConnections: number
   port: number
   autoStopSeeding?: boolean
@@ -52,471 +53,200 @@ export interface EngineSettings {
   autoStart?: boolean
 }
 
-// Public trackers that WebTorrent supports (WebSocket + UDP/HTTP via webtorrent)
-const PUBLIC_TRACKERS = [
-  'wss://tracker.openwebtorrent.com',
-  'wss://tracker.btorrent.xyz',
-  'wss://tracker.files.fm:7073/announce',
-  'udp://tracker.opentrackr.org:1337/announce',
-  'udp://open.demonii.com:1337/announce',
-  'udp://tracker.openbittorrent.com:6969/announce',
-  'udp://open.stealth.si:80/announce',
-  'udp://exodus.desync.com:6969/announce',
-  'udp://tracker.torrent.eu.org:451/announce',
-  'http://tracker.opentrackr.org:1337/announce'
-]
-
-const DEFAULT_SETTINGS: EngineSettings = {
-  downloadDir: path.join(os.homedir(), 'Downloads'),
-  maxDownloadSpeed: -1,
-  maxUploadSpeed: -1,
-  maxConnections: 200,
-  port: 6881,
-  autoStopSeeding: false,
-  minimizeToTray: true,
-  startMinimized: false,
-  showNotifications: true,
-  autoStart: false
+interface PendingRequest {
+  resolve: (value: any) => void
+  reject: (error: Error) => void
 }
 
 export class TorrentEngine {
-  private client: any = null
-  private settings: EngineSettings
+  private worker: any = null
+  private _ready = false
   private dataPath: string
   private settingsPath: string
-  private torrentsPath: string
-  private pausedSet: Set<string> = new Set()
-  private completedSet: Set<string> = new Set()  // tracks auto-stop handled
-  private _ready = false
-  // Cache for static torrent metadata (files, trackers) — rebuilt only once per torrent
-  private staticCache: Map<string, { files: TorrentInfo['files']; trackers: string[] }> = new Map()
+  private settings: EngineSettings
+  private pendingRequests = new Map<string, PendingRequest>()
+  private msgId = 0
 
   constructor() {
-    // Portable: store data next to exe if portable, else in appData
-    this.dataPath = path.join(app.getPath('userData'), 'liquid-torrent-data')
+    const portableDir = path.join(path.dirname(process.execPath), 'LiquidTorrentData')
+    const isPortable = !process.execPath.includes('node_modules')
+    this.dataPath = isPortable && fs.existsSync(path.dirname(portableDir))
+      ? portableDir
+      : path.join(app.getPath('appData'), 'liquid-torrent')
     fs.mkdirSync(this.dataPath, { recursive: true })
-
     this.settingsPath = path.join(this.dataPath, 'settings.json')
-    this.torrentsPath = path.join(this.dataPath, 'torrents.json')
-
     this.settings = this.loadSettings()
   }
 
-  /** Must be called before any torrent operations */
+  /** Start the worker process and initialize WebTorrent inside it */
   async init(): Promise<void> {
-    const WebTorrent = (await import('webtorrent')).default
-    this.client = new WebTorrent({
-      maxConns: this.settings.maxConnections,
-      downloadLimit: this.settings.maxDownloadSpeed > 0 ? this.settings.maxDownloadSpeed : -1,
-      uploadLimit: this.settings.maxUploadSpeed > 0 ? this.settings.maxUploadSpeed : -1
+    // Fork the worker from the built output
+    const workerPath = path.join(__dirname, 'torrent-worker.js')
+    this.worker = utilityProcess.fork(workerPath, [], {
+      serviceName: 'LiquidTorrent-Engine'
     })
-    this.client.on('error', (err: Error) => {
-      console.error('[TorrentEngine] Client error:', err.message)
+
+    // Listen for responses
+    this.worker.on('message', (data: { id: string; result?: any; error?: string }) => {
+      const pending = this.pendingRequests.get(data.id)
+      if (pending) {
+        this.pendingRequests.delete(data.id)
+        if (data.error) {
+          pending.reject(new Error(data.error))
+        } else {
+          pending.resolve(data.result)
+        }
+      }
     })
+
+    this.worker.on('exit', (code: number) => {
+      console.error(`[TorrentEngine] Worker exited with code ${code}`)
+      // Reject all pending requests
+      for (const [id, pending] of this.pendingRequests) {
+        pending.reject(new Error('Worker process exited'))
+        this.pendingRequests.delete(id)
+      }
+    })
+
+    // Initialize WebTorrent inside the worker
+    await this.send('init', { dataPath: this.dataPath })
     this._ready = true
-    console.log('[TorrentEngine] Initialized')
+    console.log('[TorrentEngine] Worker initialized (off main thread!)')
   }
 
-  // ─── Settings ───────────────────────────────────────────────
+  /** Send a message to the worker and wait for response */
+  private send(action: string, args?: any): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const id = `msg_${++this.msgId}_${Date.now()}`
+      this.pendingRequests.set(id, { resolve, reject })
+      this.worker.postMessage({ id, action, args })
+
+      // Timeout after 30s (for long operations like loadSaved)
+      setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id)
+          reject(new Error(`Timeout: ${action}`))
+        }
+      }, 30000)
+    })
+  }
+
+  /** Send a message without waiting for response (fire-and-forget) */
+  private sendNoWait(action: string, args?: any): void {
+    const id = `msg_${++this.msgId}_${Date.now()}`
+    // Still set up a pending handler to avoid memory leaks on error
+    this.pendingRequests.set(id, {
+      resolve: () => this.pendingRequests.delete(id),
+      reject: () => this.pendingRequests.delete(id)
+    })
+    this.worker.postMessage({ id, action, args })
+    // Auto-cleanup after 10s
+    setTimeout(() => this.pendingRequests.delete(id), 10000)
+  }
+
+  // ─── Settings (loaded in main for UI, synced to worker) ─────
 
   private loadSettings(): EngineSettings {
+    const DEFAULT_SETTINGS: EngineSettings = {
+      downloadDir: path.join(os.homedir(), 'Downloads'),
+      maxDownloadSpeed: -1, maxUploadSpeed: -1,
+      maxConnections: 55, port: 6881,
+      autoStopSeeding: false, minimizeToTray: true,
+      startMinimized: false, showNotifications: true, autoStart: false
+    }
     try {
       if (fs.existsSync(this.settingsPath)) {
-        const data = fs.readFileSync(this.settingsPath, 'utf-8')
-        return { ...DEFAULT_SETTINGS, ...JSON.parse(data) }
+        return { ...DEFAULT_SETTINGS, ...JSON.parse(fs.readFileSync(this.settingsPath, 'utf-8')) }
       }
-    } catch (e) {
-      console.error('[TorrentEngine] Failed to load settings:', e)
-    }
+    } catch {}
     return { ...DEFAULT_SETTINGS }
-  }
-
-  saveSettings(partial: Partial<EngineSettings>): void {
-    this.settings = { ...this.settings, ...partial }
-    try {
-      fs.writeFileSync(this.settingsPath, JSON.stringify(this.settings, null, 2), 'utf-8')
-      // Apply runtime limits
-      if (this.client) {
-        this.client.throttleDownload(this.settings.maxDownloadSpeed > 0 ? this.settings.maxDownloadSpeed : -1)
-        this.client.throttleUpload(this.settings.maxUploadSpeed > 0 ? this.settings.maxUploadSpeed : -1)
-      }
-    } catch (e) {
-      console.error('[TorrentEngine] Failed to save settings:', e)
-    }
   }
 
   getSettings(): EngineSettings {
     return { ...this.settings }
   }
 
-  // ─── Torrent persistence ─────────────────────────────────────
-
-  saveTorrentsState(): void {
-    try {
-      const torrentFilesDir = path.join(this.dataPath, 'torrent-files')
-      if (!fs.existsSync(torrentFilesDir)) fs.mkdirSync(torrentFilesDir, { recursive: true })
-
-      const data = this.client.torrents.map(t => {
-        // Save .torrent file for proper resume with verification
-        let torrentFilePath: string | null = null
-        try {
-          const torrentBuf = t.torrentFile
-          if (torrentBuf && torrentBuf.length > 0) {
-            torrentFilePath = path.join(torrentFilesDir, `${t.infoHash}.torrent`)
-            fs.writeFileSync(torrentFilePath, torrentBuf)
-          }
-        } catch {}
-
-        return {
-          magnetURI: t.magnetURI,
-          infoHash: t.infoHash,
-          savePath: (t as any).path || this.settings.downloadDir,
-          paused: this.pausedSet.has(t.infoHash),
-          hasTorrentFile: !!torrentFilePath
-        }
-      })
-      fs.writeFileSync(this.torrentsPath, JSON.stringify(data, null, 2), 'utf-8')
-    } catch (e) {
-      console.error('[TorrentEngine] Failed to save torrents:', e)
-    }
+  async updateSettings(newSettings: Partial<EngineSettings>): Promise<EngineSettings> {
+    this.settings = { ...this.settings, ...newSettings }
+    // Sync to worker
+    const result = await this.send('updateSettings', { settings: newSettings })
+    return result
   }
+
+  // ─── Torrent Operations (delegated to worker) ──────────────
 
   async loadSavedTorrents(): Promise<void> {
-    try {
-      if (!fs.existsSync(this.torrentsPath)) return
-      const torrentFilesDir = path.join(this.dataPath, 'torrent-files')
-      const data = JSON.parse(fs.readFileSync(this.torrentsPath, 'utf-8')) as Array<{
-        magnetURI: string
-        infoHash?: string
-        savePath: string
-        paused: boolean
-        hasTorrentFile?: boolean
-      }>
-
-      // Parallel restoration — all torrents load simultaneously
-      const promises = data.map(async (entry) => {
-        try {
-          const torrentFile = entry.infoHash
-            ? path.join(torrentFilesDir, `${entry.infoHash}.torrent`)
-            : null
-
-          if (torrentFile && fs.existsSync(torrentFile)) {
-            console.log(`[TorrentEngine] Restoring from .torrent: ${entry.infoHash}`)
-            await this.addTorrentFile(torrentFile, entry.savePath, !entry.paused)
-          } else {
-            console.log(`[TorrentEngine] Restoring from magnet: ${entry.infoHash || 'unknown'}`)
-            await this.addMagnet(entry.magnetURI, entry.savePath, !entry.paused)
-          }
-
-          if (entry.paused && entry.infoHash) {
-            this.pausedSet.add(entry.infoHash)
-          }
-        } catch (e) {
-          console.error('[TorrentEngine] Failed to restore torrent:', e)
-        }
-      })
-
-      await Promise.allSettled(promises)
-      console.log(`[TorrentEngine] Restored ${data.length} torrents (parallel)`)
-    } catch (e) {
-      console.error('[TorrentEngine] Failed to load saved torrents:', e)
-    }
+    await this.send('loadSaved')
   }
 
-  // ─── Add / Remove ───────────────────────────────────────────
-
-  addTorrentFile(filePath: string, savePath?: string, start = true): Promise<TorrentInfo> {
-    return new Promise((resolve, reject) => {
-      const dest = savePath || this.settings.downloadDir
-      fs.mkdirSync(dest, { recursive: true })
-
-      let buffer: Buffer
-      try {
-        buffer = fs.readFileSync(filePath)
-      } catch (e) {
-        return reject(new Error(`Файл не найден: ${filePath}`))
-      }
-
-      // Check if already exists
-      const existing = this.client.torrents.find(t => {
-        try {
-          return t.infoHash && buffer.toString('hex').includes(t.infoHash)
-        } catch { return false }
-      })
-      if (existing) {
-        return resolve(this.getTorrentInfo(existing))
-      }
-
-      this.client.add(buffer, { path: dest, announce: PUBLIC_TRACKERS }, (torrent) => {
-        console.log(`[TorrentEngine] Torrent ready: ${torrent.name} | ${torrent.files?.length || 0} files`)
-        this.setupAutoStop(torrent)
-        if (!start) {
-          torrent.pause()
-          this.pausedSet.add(torrent.infoHash)
-        }
-        this.saveTorrentsState()
-        resolve(this.getTorrentInfo(torrent))
-      })
-    })
+  async addTorrentFile(filePath: string, savePath?: string, start = true): Promise<TorrentInfo> {
+    return this.send('addTorrentFile', { filePath, savePath, start })
   }
 
-  addMagnet(magnetURI: string, savePath?: string, start = true): Promise<TorrentInfo> {
-    return new Promise((resolve, reject) => {
-      if (!magnetURI.startsWith('magnet:')) {
-        return reject(new Error('Неверная магнет-ссылка'))
-      }
-
-      const dest = savePath || this.settings.downloadDir
-      fs.mkdirSync(dest, { recursive: true })
-
-      // Check if already added
-      const existing = this.client.torrents.find(t => magnetURI.includes(t.infoHash))
-      if (existing) {
-        return resolve(this.getTorrentInfo(existing))
-      }
-
-      this.client.add(magnetURI, { path: dest, announce: PUBLIC_TRACKERS }, (torrent) => {
-        console.log(`[TorrentEngine] Magnet ready: ${torrent.name}`)
-        this.setupAutoStop(torrent)
-        if (!start) {
-          torrent.pause()
-          this.pausedSet.add(torrent.infoHash)
-        }
-        this.saveTorrentsState()
-        resolve(this.getTorrentInfo(torrent))
-      })
-    })
-  }
-
-  /** Auto-stop seeding 10 seconds after download completes (if enabled in settings) */
-  private setupAutoStop(torrent: any): void {
-    torrent.on('done', () => {
-      console.log(`[TorrentEngine] Download complete: ${torrent.name}`)
-      if (this.settings.autoStopSeeding && !this.completedSet.has(torrent.infoHash)) {
-        this.completedSet.add(torrent.infoHash)
-        console.log(`[TorrentEngine] Auto-stop in 10s: ${torrent.name}`)
-        setTimeout(() => {
-          try {
-            if (!this.pausedSet.has(torrent.infoHash)) {
-              torrent.pause()
-              this.pausedSet.add(torrent.infoHash)
-              this.saveTorrentsState()
-              console.log(`[TorrentEngine] Auto-stopped: ${torrent.name}`)
-            }
-          } catch {}
-        }, 10000)
-      }
-    })
+  async addMagnet(magnetURI: string, savePath?: string, start = true): Promise<TorrentInfo> {
+    return this.send('addMagnet', { magnetURI, savePath, start })
   }
 
   removeTorrent(infoHash: string, deleteFiles = false): void {
-    const torrent = this.client.torrents.find(t => t.infoHash === infoHash)
-    if (!torrent) return
-
-    this.client.remove(infoHash, { destroyStore: deleteFiles }, (err) => {
-      if (err) console.error('[TorrentEngine] Remove error:', err)
-    })
-    this.pausedSet.delete(infoHash)
-    this.staticCache.delete(infoHash)  // Clear cached file/tracker data
-    this.saveTorrentsState()
+    this.sendNoWait('remove', { infoHash, deleteFiles })
   }
 
-  // ─── Pause / Resume ─────────────────────────────────────────
-
   pauseTorrent(infoHash: string): void {
-    const torrent = this.client.torrents.find(t => t.infoHash === infoHash)
-    if (torrent) {
-      torrent.pause()
-      // Deselect all files to truly stop downloading
-      try { torrent.files?.forEach(f => f.deselect()) } catch {}
-      // Destroy all peer connections
-      try {
-        if (torrent.wires) {
-          torrent.wires.forEach(w => { try { w.destroy() } catch {} })
-        }
-      } catch {}
-      this.pausedSet.add(infoHash)
-      this.saveTorrentsState()
-      console.log(`[TorrentEngine] Paused: ${torrent.name}`)
-    }
+    this.sendNoWait('pause', { infoHash })
   }
 
   resumeTorrent(infoHash: string): void {
-    const torrent = this.client.torrents.find(t => t.infoHash === infoHash)
-    if (torrent) {
-      // Re-select all files
-      try { torrent.files?.forEach(f => f.select()) } catch {}
-      torrent.resume()
-      this.pausedSet.delete(infoHash)
-      this.saveTorrentsState()
-      console.log(`[TorrentEngine] Resumed: ${torrent.name}`)
-    }
+    this.sendNoWait('resume', { infoHash })
   }
 
   pauseAll(): void {
-    this.client.torrents.forEach(t => {
-      t.pause()
-      try { t.files?.forEach(f => f.deselect()) } catch {}
-      try {
-        if (t.wires) t.wires.forEach(w => { try { w.destroy() } catch {} })
-      } catch {}
-      this.pausedSet.add(t.infoHash)
-    })
-    this.saveTorrentsState()
-    console.log(`[TorrentEngine] Paused all (${this.client.torrents.length} torrents)`)
+    this.sendNoWait('pauseAll')
   }
 
   resumeAll(): void {
-    this.client.torrents.forEach(t => {
-      try { t.files?.forEach(f => f.select()) } catch {}
-      t.resume()
-      this.pausedSet.delete(t.infoHash)
-    })
-    this.saveTorrentsState()
-    console.log(`[TorrentEngine] Resumed all`)
+    this.sendNoWait('resumeAll')
   }
-
-  // ─── Per-torrent throttle ──────────────────────────────────
 
   throttleTorrent(infoHash: string, downLimit: number, upLimit: number): void {
-    const torrent = this.client.torrents.find(t => t.infoHash === infoHash)
-    if (!torrent) return
-
-    // WebTorrent supports throttleGroups per torrent via _peers throttle
-    // downLimit/upLimit in bytes/s, 0 = unlimited
-    try {
-      if (typeof (torrent as any).throttleDownload === 'function') {
-        (torrent as any).throttleDownload(downLimit > 0 ? downLimit : -1)
-      }
-      if (typeof (torrent as any).throttleUpload === 'function') {
-        (torrent as any).throttleUpload(upLimit > 0 ? upLimit : -1)
-      }
-    } catch {}
-
-    console.log(`[TorrentEngine] Throttle ${torrent.name}: down=${downLimit}, up=${upLimit}`)
+    this.sendNoWait('throttle', { infoHash, downLimit, upLimit })
   }
 
-  // ─── Info ───────────────────────────────────────────────────
+  // ─── Info Queries (delegated to worker) ────────────────────
 
-  /** Build and cache static file/tracker info (only once per torrent) */
-  private getCachedStatic(torrent: any): { files: TorrentInfo['files']; trackers: string[] } {
-    const hash = torrent.infoHash
-    if (this.staticCache.has(hash)) return this.staticCache.get(hash)!
-
-    // Only cache once metadata is available
-    if (torrent.files?.length > 0) {
-      const cached = {
-        files: torrent.files.map((f: any, i: number) => ({
-          index: i,
-          path: f.path,
-          name: f.name,
-          size: f.length,
-          progress: 0  // static snapshot, updated in getFullTorrentInfo
-        })),
-        trackers: torrent.announce ? [...torrent.announce] : []
-      }
-      this.staticCache.set(hash, cached)
-      return cached
-    }
-
-    return { files: [], trackers: torrent.announce ? [...torrent.announce] : [] }
+  async getAllTorrentsLight(): Promise<Omit<TorrentInfo, 'files' | 'trackers'>[]> {
+    return this.send('getAllLight')
   }
 
-  /** Core torrent state (without heavy file arrays) */
-  private getTorrentBase(torrent: any): Omit<TorrentInfo, 'files' | 'trackers'> {
-    const isPaused = this.pausedSet.has(torrent.infoHash)
-    const progress = Math.round(torrent.progress * 100)
-
-    let state = 'Загрузка'
-    if (isPaused) {
-      state = 'Приостановлено'
-    } else if (progress >= 100) {
-      state = torrent.uploadSpeed > 0 ? 'Раздача' : 'Завершено'
-    } else if (!torrent.name || torrent.name === torrent.infoHash) {
-      state = 'Загрузка метаданных'
-    }
-
-    let eta = 0
-    if (torrent.downloadSpeed > 0 && torrent.length > 0) {
-      const remaining = torrent.length - torrent.downloaded
-      eta = remaining / torrent.downloadSpeed
-    }
-
-    return {
-      id: torrent.infoHash,
-      name: torrent.name || 'Загрузка метаданных...',
-      state,
-      paused: isPaused,
-      progress,
-      downloadSpeed: torrent.downloadSpeed,
-      uploadSpeed: torrent.uploadSpeed,
-      size: torrent.length || 0,
-      totalDownload: torrent.downloaded,
-      totalUpload: torrent.uploaded,
-      numPeers: torrent.numPeers,
-      numSeeds: (torrent as any)._peersLength || 0,
-      eta,
-      savePath: path.join((torrent as any).path || this.settings.downloadDir, torrent.name || ''),
-      magnetURI: torrent.magnetURI || '',
-      infoHash: torrent.infoHash,
-      ratio: torrent.downloaded > 0 ? torrent.uploaded / torrent.downloaded : 0,
-      creationDate: (torrent as any).created ? new Date((torrent as any).created).toISOString() : null,
-      comment: (torrent as any).comment || null
-    }
+  async getFullTorrentInfo(infoHash: string): Promise<TorrentInfo | null> {
+    return this.send('getFullInfo', { infoHash })
   }
 
-  /** Full info with files/trackers (for compatibility & initial add) */
-  getTorrentInfo(torrent: any): TorrentInfo {
-    const base = this.getTorrentBase(torrent)
-    const cached = this.getCachedStatic(torrent)
-    return { ...base, files: cached.files, trackers: cached.trackers }
+  async getAllTorrents(): Promise<TorrentInfo[]> {
+    return this.send('getAllTorrents')
   }
 
-  /** Light version — no files/trackers, for fast polling every 1.5-2s */
-  getAllTorrentsLight(): Omit<TorrentInfo, 'files' | 'trackers'>[] {
-    return this.client.torrents.map((t: any) => this.getTorrentBase(t))
+  async getSessionStats(): Promise<SessionStats> {
+    return this.send('getSessionStats')
   }
 
-  /** Full info for one torrent — files with live progress, trackers */
-  getFullTorrentInfo(infoHash: string): TorrentInfo | null {
-    const torrent = this.client.torrents.find((t: any) => t.infoHash === infoHash)
-    if (!torrent) return null
+  // ─── Persistence (for backward compat) ─────────────────────
 
-    const base = this.getTorrentBase(torrent)
-    // Live file progress (computed on-demand, not every tick)
-    const files = torrent.files?.map((f: any, i: number) => ({
-      index: i,
-      path: f.path,
-      name: f.name,
-      size: f.length,
-      progress: Math.round((f as any).progress * 100) || 0
-    })) || []
-    const trackers = torrent.announce ? [...torrent.announce] : []
-    return { ...base, files, trackers }
+  saveTorrentsState(): void {
+    // Sync save — used only at shutdown
+    // Worker does its own debounced saves during operation
+    this.sendNoWait('shutdown')
   }
 
-  getAllTorrents(): TorrentInfo[] {
-    return this.client.torrents.map((t: any) => this.getTorrentInfo(t))
-  }
-
-  getSessionStats(): SessionStats {
-    return {
-      downloadRate: this.client.downloadSpeed,
-      uploadRate: this.client.uploadSpeed,
-      numPeers: this.client.torrents.reduce((acc: number, t: any) => acc + t.numPeers, 0),
-      numTorrents: this.client.torrents.length
-    }
-  }
-
-  // ─── Shutdown ───────────────────────────────────────────────
+  // ─── Shutdown ──────────────────────────────────────────────
 
   async shutdown(): Promise<void> {
-    this.saveTorrentsState()
-    return new Promise((resolve) => {
-      this.client.destroy((err) => {
-        if (err) console.error('[TorrentEngine] Shutdown error:', err)
-        resolve()
-      })
-    })
+    try {
+      await this.send('shutdown')
+    } catch {
+      // Worker may have already exited
+    }
+    try {
+      this.worker?.kill()
+    } catch {}
   }
 }
