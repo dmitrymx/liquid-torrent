@@ -44,7 +44,11 @@ const PUBLIC_TRACKERS = [
   'wss://tracker.openwebtorrent.com',
   'udp://tracker.opentrackr.org:1337/announce',
   'udp://open.stealth.si:80/announce',
-  'udp://tracker.openbittorrent.com:6969/announce'
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://open.demonii.com:1337/announce',
+  'http://tracker.opentrackr.org:1337/announce'
 ]
 
 const DEFAULT_SETTINGS: EngineSettings = {
