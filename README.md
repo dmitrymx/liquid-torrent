@@ -6,7 +6,7 @@
 
 **Современный, быстрый и стильный торрент-клиент для Windows**
 
-[![Version](https://img.shields.io/badge/version-1.3.1-blue?style=for-the-badge)](https://github.com/dmitrymx/liquid-torrent/releases)
+[![Version](https://img.shields.io/badge/version-1.4.0-blue?style=for-the-badge)](https://github.com/dmitrymx/liquid-torrent/releases)
 [![Electron](https://img.shields.io/badge/Electron-36-47848F?style=for-the-badge&logo=electron)](https://electronjs.org)
 [![libtorrent](https://img.shields.io/badge/libtorrent-2.0.11-orange?style=for-the-badge)](https://libtorrent.org)
 [![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
