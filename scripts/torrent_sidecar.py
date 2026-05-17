@@ -337,26 +337,37 @@ class SidecarEngine:
             h.resume()
 
     def pause_all(self):
-        self.session.pause()
+        # Iterate per-torrent so status.paused updates correctly for UI
+        with self._lock:
+            items = list(self.torrents.values())
+        for h in items:
+            if h.is_valid():
+                h.pause()
 
     def resume_all(self):
-        self.session.resume()
+        # Iterate per-torrent so status.paused updates correctly for UI
+        with self._lock:
+            items = list(self.torrents.values())
+        for h in items:
+            if h.is_valid():
+                h.resume()
 
     def throttle(self, info_hash: str, down_limit: int, up_limit: int):
         h = self.torrents.get(info_hash)
         if h and h.is_valid():
-            h.set_download_limit(down_limit if down_limit > 0 else -1)
-            h.set_upload_limit(up_limit if up_limit > 0 else -1)
+            # libtorrent: 0 = unlimited, >0 = limit in bytes/sec
+            h.set_download_limit(down_limit if down_limit > 0 else 0)
+            h.set_upload_limit(up_limit if up_limit > 0 else 0)
 
     def update_settings(self, new_settings: dict) -> dict:
         self._settings.update(new_settings)
         pack = {}
         if "maxDownloadSpeed" in new_settings:
             v = new_settings["maxDownloadSpeed"]
-            pack["download_rate_limit"] = v if v > 0 else -1
+            pack["download_rate_limit"] = v if v > 0 else 0
         if "maxUploadSpeed" in new_settings:
             v = new_settings["maxUploadSpeed"]
-            pack["upload_rate_limit"] = v if v > 0 else -1
+            pack["upload_rate_limit"] = v if v > 0 else 0
         if "maxConnections" in new_settings:
             pack["connections_limit"] = new_settings["maxConnections"]
         if pack:
@@ -434,6 +445,14 @@ class SidecarEngine:
                 except Exception:
                     pass
 
+    def save(self):
+        """Save torrents.json + resume data without stopping the engine."""
+        self._save_all_resume()
+        time.sleep(0.3)
+        self._process_alerts()
+        self._save_torrents()
+        log("Manual save complete")
+
     def shutdown(self):
         self._running = False
         self._save_all_resume()
@@ -506,6 +525,9 @@ def handle_message(msg: dict):
             respond(msg_id, engine.get_all_torrents())
         elif action == "getSessionStats":
             respond(msg_id, engine.get_session_stats())
+        elif action == "save":
+            engine.save()
+            respond(msg_id, None)
         elif action == "shutdown":
             engine.shutdown()
             respond(msg_id, None)

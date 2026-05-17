@@ -70,11 +70,9 @@ export class TorrentEngine {
   private msgId = 0
 
   constructor() {
-    const portableDir = path.join(path.dirname(process.execPath), 'LiquidTorrentData')
-    const isPortable = !process.execPath.includes('node_modules')
-    this.dataPath = isPortable && fs.existsSync(path.dirname(portableDir))
-      ? portableDir
-      : path.join(app.getPath('appData'), 'liquid-torrent')
+    // Always use %APPDATA%/liquid-torrent for stable data persistence
+    // Portable NSIS extracts to random temp dirs — can't reliably write next to exe
+    this.dataPath = path.join(app.getPath('appData'), 'liquid-torrent')
     fs.mkdirSync(this.dataPath, { recursive: true })
     this.settingsPath = path.join(this.dataPath, 'settings.json')
     this.settings = this.loadSettings()
@@ -299,7 +297,7 @@ export class TorrentEngine {
   // ─── Persistence ───────────────────────────────────────────
 
   saveTorrentsState(): void {
-    this.sendNoWait('shutdown')
+    this.sendNoWait('save')
   }
 
   // ─── Shutdown ──────────────────────────────────────────────
