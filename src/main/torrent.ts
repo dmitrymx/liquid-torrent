@@ -1,13 +1,14 @@
 /**
- * Liquid Torrent — TorrentEngine Proxy
- * Thin proxy that communicates with the WebTorrent worker via utilityProcess.
- * All CPU-heavy work runs in the worker process — main thread stays responsive.
+ * Liquid Torrent — TorrentEngine Proxy (libtorrent sidecar)
+ * Communicates with Python libtorrent sidecar via stdin/stdout JSON-RPC.
+ * All CPU-heavy work runs in the Python process — main thread stays responsive.
  */
-import { utilityProcess } from 'electron'
 import { app } from 'electron'
+import { spawn, ChildProcess } from 'child_process'
 import * as path from 'path'
 import * as fs from 'fs'
 import * as os from 'os'
+import * as readline from 'readline'
 
 export interface TorrentInfo {
   id: string
@@ -59,7 +60,8 @@ interface PendingRequest {
 }
 
 export class TorrentEngine {
-  private worker: any = null
+  private worker: ChildProcess | null = null
+  private rl: readline.Interface | null = null
   private _ready = false
   private dataPath: string
   private settingsPath: string
@@ -78,51 +80,115 @@ export class TorrentEngine {
     this.settings = this.loadSettings()
   }
 
-  /** Start the worker process and initialize WebTorrent inside it */
+  /** Start the Python libtorrent sidecar process */
   async init(): Promise<void> {
-    // Fork the worker from the built output
-    const workerPath = path.join(__dirname, 'torrent-worker.js')
-    this.worker = utilityProcess.fork(workerPath, [], {
-      serviceName: 'LiquidTorrent-Engine'
-    })
+    const sidecarPath = this.findSidecar()
+    console.log(`[TorrentEngine] Starting sidecar: ${sidecarPath}`)
 
-    // Listen for responses
-    this.worker.on('message', (data: { id: string; result?: any; error?: string }) => {
-      const pending = this.pendingRequests.get(data.id)
-      if (pending) {
-        this.pendingRequests.delete(data.id)
-        if (data.error) {
-          pending.reject(new Error(data.error))
-        } else {
-          pending.resolve(data.result)
+    if (sidecarPath.endsWith('.exe')) {
+      // Production: bundled PyInstaller executable
+      this.worker = spawn(sidecarPath, [], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true
+      })
+    } else {
+      // Dev: find real Python (not WindowsApps store shim)
+      const pythonPath = this.findPython()
+      console.log(`[TorrentEngine] Using Python: ${pythonPath}`)
+      this.worker = spawn(pythonPath, [sidecarPath], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true
+      })
+    }
+
+    // Parse JSON responses line-by-line from stdout
+    this.rl = readline.createInterface({ input: this.worker.stdout! })
+    this.rl.on('line', (line: string) => {
+      try {
+        const data = JSON.parse(line)
+        const pending = this.pendingRequests.get(data.id)
+        if (pending) {
+          this.pendingRequests.delete(data.id)
+          if (data.error) {
+            pending.reject(new Error(data.error))
+          } else {
+            pending.resolve(data.result)
+          }
         }
+      } catch {
+        // Not JSON — ignore
       }
     })
 
-    this.worker.on('exit', (code: number) => {
-      console.error(`[TorrentEngine] Worker exited with code ${code}`)
-      // Reject all pending requests
+    // Log stderr (Python's print to stderr)
+    if (this.worker.stderr) {
+      const stderrRl = readline.createInterface({ input: this.worker.stderr })
+      stderrRl.on('line', (line: string) => {
+        console.log(`[Sidecar] ${line}`)
+      })
+    }
+
+    this.worker.on('exit', (code: number | null) => {
+      console.error(`[TorrentEngine] Sidecar exited with code ${code}`)
       for (const [id, pending] of this.pendingRequests) {
-        pending.reject(new Error('Worker process exited'))
+        pending.reject(new Error('Sidecar process exited'))
         this.pendingRequests.delete(id)
       }
     })
 
-    // Initialize WebTorrent inside the worker
+    // Initialize libtorrent inside the sidecar
     await this.send('init', { dataPath: this.dataPath })
     this._ready = true
-    console.log('[TorrentEngine] Worker initialized (off main thread!)')
+    console.log('[TorrentEngine] libtorrent sidecar initialized!')
   }
 
-  /** Send a message to the worker and wait for response */
+  /** Find the sidecar executable or script */
+  private findSidecar(): string {
+    // 1. Check for bundled PyInstaller exe next to the app
+    const exeDir = path.dirname(process.execPath)
+    const candidates = [
+      path.join(exeDir, 'resources', 'torrent_sidecar.exe'),
+      path.join(exeDir, 'resources', 'torrent-engine.exe'),
+      path.join(exeDir, 'torrent_sidecar.exe'),
+      // 2. Dev mode: scripts folder
+      path.join(__dirname, '..', '..', 'scripts', 'torrent_sidecar.py'),
+      path.join(__dirname, '..', 'scripts', 'torrent_sidecar.py'),
+    ]
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c
+    }
+    // Fallback: assume it's in scripts/
+    return path.join(process.cwd(), 'scripts', 'torrent_sidecar.py')
+  }
+
+  /** Find real Python installation (skip WindowsApps store shim) */
+  private findPython(): string {
+    const home = os.homedir()
+    // Check common Python installations where libtorrent is installed
+    const candidates = [
+      path.join(home, 'AppData', 'Local', 'Programs', 'Python', 'Python311', 'python.exe'),
+      path.join(home, 'AppData', 'Local', 'Programs', 'Python', 'Python312', 'python.exe'),
+      path.join(home, 'AppData', 'Local', 'Programs', 'Python', 'Python310', 'python.exe'),
+      path.join(home, 'AppData', 'Local', 'Programs', 'Python', 'Python313', 'python.exe'),
+      'C:\\Python311\\python.exe',
+      'C:\\Python312\\python.exe',
+    ]
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c
+    }
+    // Fallback to PATH
+    return 'python'
+  }
+
+  /** Send a message to the sidecar and wait for response */
   private send(action: string, args?: any, timeoutMs?: number): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = `msg_${++this.msgId}_${Date.now()}`
       this.pendingRequests.set(id, { resolve, reject })
-      this.worker.postMessage({ id, action, args })
 
-      // Operation-specific timeouts:
-      // loadSaved/addTorrentFile may verify 155GB+ → needs minutes
+      const msg = JSON.stringify({ id, action, args }) + '\n'
+      this.worker!.stdin!.write(msg)
+
       const timeout = timeoutMs ?? 30000
       setTimeout(() => {
         if (this.pendingRequests.has(id)) {
@@ -136,24 +202,23 @@ export class TorrentEngine {
   /** Send a message without waiting for response (fire-and-forget) */
   private sendNoWait(action: string, args?: any): void {
     const id = `msg_${++this.msgId}_${Date.now()}`
-    // Still set up a pending handler to avoid memory leaks on error
     this.pendingRequests.set(id, {
       resolve: () => this.pendingRequests.delete(id),
       reject: () => this.pendingRequests.delete(id)
     })
-    this.worker.postMessage({ id, action, args })
-    // Auto-cleanup after 10s
+    const msg = JSON.stringify({ id, action, args }) + '\n'
+    this.worker!.stdin!.write(msg)
     setTimeout(() => this.pendingRequests.delete(id), 10000)
   }
 
-  // ─── Settings (loaded in main for UI, synced to worker) ─────
+  // ─── Settings (loaded in main for UI, synced to sidecar) ─────
 
   private loadSettings(): EngineSettings {
     const DEFAULT_SETTINGS: EngineSettings = {
       downloadDir: path.join(os.homedir(), 'Downloads'),
       maxDownloadSpeed: -1,
-      maxUploadSpeed: 5 * 1024 * 1024,  // 5 MB/s default — prevents upload from saturating upstream
-      maxConnections: 100, port: 0,  // 0 = random port, avoids ISP throttle
+      maxUploadSpeed: 5 * 1024 * 1024,
+      maxConnections: 200, port: 6881,
       autoStopSeeding: false, minimizeToTray: true,
       startMinimized: false, showNotifications: true, autoStart: false
     }
@@ -171,15 +236,13 @@ export class TorrentEngine {
 
   async updateSettings(newSettings: Partial<EngineSettings>): Promise<EngineSettings> {
     this.settings = { ...this.settings, ...newSettings }
-    // Sync to worker
     const result = await this.send('updateSettings', { settings: newSettings })
     return result
   }
 
-  // ─── Torrent Operations (delegated to worker) ──────────────
+  // ─── Torrent Operations (delegated to sidecar) ──────────────
 
   async loadSavedTorrents(): Promise<void> {
-    // 155GB+ torrent verification can take 5+ minutes
     await this.send('loadSaved', undefined, 600000)
   }
 
@@ -215,7 +278,7 @@ export class TorrentEngine {
     this.sendNoWait('throttle', { infoHash, downLimit, upLimit })
   }
 
-  // ─── Info Queries (delegated to worker) ────────────────────
+  // ─── Info Queries (delegated to sidecar) ────────────────────
 
   async getAllTorrentsLight(): Promise<Omit<TorrentInfo, 'files' | 'trackers'>[]> {
     return this.send('getAllLight')
@@ -233,11 +296,9 @@ export class TorrentEngine {
     return this.send('getSessionStats')
   }
 
-  // ─── Persistence (for backward compat) ─────────────────────
+  // ─── Persistence ───────────────────────────────────────────
 
   saveTorrentsState(): void {
-    // Sync save — used only at shutdown
-    // Worker does its own debounced saves during operation
     this.sendNoWait('shutdown')
   }
 
@@ -245,11 +306,12 @@ export class TorrentEngine {
 
   async shutdown(): Promise<void> {
     try {
-      await this.send('shutdown')
+      await this.send('shutdown', undefined, 5000)
     } catch {
-      // Worker may have already exited
+      // Sidecar may have already exited
     }
     try {
+      this.rl?.close()
       this.worker?.kill()
     } catch {}
   }

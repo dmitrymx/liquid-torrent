@@ -231,7 +231,7 @@ app.on('open-file', (_e, filePath) => {
 
 app.whenReady().then(async () => {
   engine = new TorrentEngine()
-  await engine.init()  // async: dynamically loads ESM webtorrent
+  await engine.init()  // async: starts Python libtorrent sidecar
   setupIPC()
   createWindow()
   createTray()
