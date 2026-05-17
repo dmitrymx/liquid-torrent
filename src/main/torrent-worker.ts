@@ -301,15 +301,18 @@ async function handleLoadSaved(): Promise<void> {
         ? path.join(torrentFilesDir, `${entry.infoHash}.torrent`)
         : null
 
-      // skipVerify ONLY for completed (100%) torrents!
-      // For incomplete torrents, verification builds correct bitfield
-      // so peers know which pieces we need
-      const isCompleted = entry.progress >= 100
+      // ALWAYS skipVerify=true!
+      // WebTorrent verification runs SHA1 synchronously on the JS event loop.
+      // For a 155GB torrent (39862 pieces × 4MB), this blocks ALL peer I/O for minutes.
+      // libtorrent (qBittorrent) does this in C++ async threads — we cannot.
+      // Trade-off: incomplete torrents lose partial progress on restart,
+      // but download starts INSTANTLY instead of freezing for 5+ minutes.
+      // TODO: save/restore bitfield for proper resume without verification.
 
       if (torrentFile && fs.existsSync(torrentFile)) {
-        await handleAddTorrentFile({ filePath: torrentFile, savePath: entry.savePath, start: !entry.paused, skipVerify: isCompleted })
+        await handleAddTorrentFile({ filePath: torrentFile, savePath: entry.savePath, start: !entry.paused, skipVerify: true })
       } else {
-        await handleAddMagnet({ magnetURI: entry.magnetURI, savePath: entry.savePath, start: !entry.paused, skipVerify: isCompleted })
+        await handleAddMagnet({ magnetURI: entry.magnetURI, savePath: entry.savePath, start: !entry.paused, skipVerify: true })
       }
 
       if (entry.paused && entry.infoHash) pausedSet.add(entry.infoHash)
@@ -347,8 +350,8 @@ function handleAddTorrentFile(args: { filePath: string; savePath?: string; start
       strategy: 'rarest',           // Per docs: rarest-first = max download speed
       noPeersIntervalTime: 10,      // Check for peers every 10s instead of 30s
       alwaysChokeSeeders: true,     // Don't waste upload on other seeders
+      skipVerify: true,             // CRITICAL: never block event loop with SHA1 verification
     }
-    if (args.skipVerify) opts.skipVerify = true
     if (args.start === false) opts.paused = true
 
     client.add(buffer, opts, (torrent: any) => {
@@ -378,8 +381,8 @@ function handleAddMagnet(args: { magnetURI: string; savePath?: string; start?: b
       strategy: 'rarest',           // Per docs: rarest-first = max download speed
       noPeersIntervalTime: 10,      // Check for peers every 10s instead of 30s
       alwaysChokeSeeders: true,     // Don't waste upload on other seeders
+      skipVerify: true,             // CRITICAL: never block event loop with SHA1 verification
     }
-    if (args.skipVerify) opts.skipVerify = true
     if (args.start === false) opts.paused = true
 
     client.add(args.magnetURI, opts, (torrent: any) => {
