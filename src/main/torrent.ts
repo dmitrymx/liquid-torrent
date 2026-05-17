@@ -217,7 +217,7 @@ export class TorrentEngine {
     const DEFAULT_SETTINGS: EngineSettings = {
       downloadDir: path.join(os.homedir(), 'Downloads'),
       maxDownloadSpeed: -1,
-      maxUploadSpeed: 5 * 1024 * 1024,
+      maxUploadSpeed: -1,
       maxConnections: 200, port: 6881,
       autoStopSeeding: false, minimizeToTray: true,
       startMinimized: false, showNotifications: true, autoStart: false
@@ -306,13 +306,28 @@ export class TorrentEngine {
 
   async shutdown(): Promise<void> {
     try {
-      await this.send('shutdown', undefined, 5000)
+      // Send shutdown command — sidecar saves resume data + torrents.json
+      await this.send('shutdown', undefined, 10000)
     } catch {
-      // Sidecar may have already exited
+      // Sidecar may have already exited or timed out
     }
+    // Wait for the process to exit gracefully
+    await new Promise<void>((resolve) => {
+      if (!this.worker || this.worker.exitCode !== null) {
+        resolve()
+        return
+      }
+      const timeout = setTimeout(() => {
+        try { this.worker?.kill('SIGKILL') } catch {}
+        resolve()
+      }, 3000)
+      this.worker.on('exit', () => {
+        clearTimeout(timeout)
+        resolve()
+      })
+    })
     try {
       this.rl?.close()
-      this.worker?.kill()
     } catch {}
   }
 }

@@ -49,7 +49,7 @@ class SidecarEngine:
         defaults = {
             "downloadDir": os.path.expanduser("~/Downloads"),
             "maxDownloadSpeed": -1,
-            "maxUploadSpeed": 5 * 1024 * 1024,
+            "maxUploadSpeed": -1,
             "maxConnections": 200,
             "port": 6881,
         }
@@ -119,6 +119,10 @@ class SidecarEngine:
                         continue
                     self._update_info(tid, h)
                 self._update_cycle += 1
+                # Auto-save torrents list every 30 sec
+                if self._update_cycle % 30 == 0:
+                    self._save_torrents()
+                # Save resume data every 5 min
                 if self._update_cycle >= 300:
                     self._update_cycle = 0
                     self._save_all_resume()
