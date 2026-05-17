@@ -131,7 +131,8 @@ function saveTorrentsStateSync(): void {
       return {
         magnetURI: t.magnetURI, infoHash: t.infoHash,
         savePath: (t as any).path || settings.downloadDir,
-        paused: pausedSet.has(t.infoHash), hasTorrentFile
+        paused: pausedSet.has(t.infoHash), hasTorrentFile,
+        progress: Math.round(t.progress * 100)  // Save progress for skipVerify decision
       }
     })
     fs.writeFileSync(torrentsPath, JSON.stringify(data, null, 2), 'utf-8')
@@ -159,7 +160,8 @@ async function saveTorrentsStateAsync(): Promise<void> {
       return {
         magnetURI: t.magnetURI, infoHash: t.infoHash,
         savePath: (t as any).path || settings.downloadDir,
-        paused: pausedSet.has(t.infoHash), hasTorrentFile
+        paused: pausedSet.has(t.infoHash), hasTorrentFile,
+        progress: Math.round(t.progress * 100)
       }
     })
     await fs.promises.writeFile(torrentsPath, JSON.stringify(data, null, 2), 'utf-8')
@@ -168,18 +170,30 @@ async function saveTorrentsStateAsync(): Promise<void> {
   }
 }
 
-function setupAutoStop(torrent: any): void {
+function setupTorrentEvents(torrent: any): void {
+  // Peer connection logging (per WebTorrent debugging guide)
+  torrent.on('wire', (_wire: any, addr: string) => {
+    console.log(`[Worker] Peer connected: ${addr} | total: ${torrent.numPeers} | dl: ${(torrent.downloadSpeed / 1024 / 1024).toFixed(1)} MB/s`)
+  })
+  torrent.on('error', (err: Error) => {
+    console.error(`[Worker] Torrent error [${torrent.name}]:`, err.message)
+  })
+  torrent.on('warning', (err: Error) => {
+    console.warn(`[Worker] Warning [${torrent.name}]:`, err.message)
+  })
+
+  // Auto-stop seeding
   torrent.on('done', () => {
     console.log(`[Worker] Download complete: ${torrent.name}`)
-    if (settings.autoStopSeeding && !completedSet.has(torrent.infoHash)) {
-      completedSet.add(torrent.infoHash)
+    completedSet.add(torrent.infoHash)
+    if (settings.autoStopSeeding) {
       setTimeout(() => {
         try {
           if (!pausedSet.has(torrent.infoHash)) {
             torrent.pause()
             pausedSet.add(torrent.infoHash)
             scheduleSave()
-            console.log(`[Worker] Auto-stopped: ${torrent.name}`)
+            console.log(`[Worker] Auto-stopped seeding: ${torrent.name}`)
           }
         } catch {}
       }, 10000)
@@ -220,16 +234,17 @@ function getTorrentBase(torrent: any): Omit<TorrentInfo, 'files' | 'trackers'> {
 
 function getCachedStatic(torrent: any) {
   const hash = torrent.infoHash
-  if (staticCache.has(hash)) return staticCache.get(hash)!
+  // Only use cache for completed torrents (file progress doesn't change after done)
+  if (torrent.progress >= 1 && staticCache.has(hash)) return staticCache.get(hash)!
   if (torrent.files?.length > 0) {
-    const cached = {
+    const data = {
       files: torrent.files.map((f: any, i: number) => ({
         index: i, path: f.path, name: f.name, size: f.length, progress: 0
       })),
       trackers: torrent.announce ? [...torrent.announce] : []
     }
-    staticCache.set(hash, cached)
-    return cached
+    if (torrent.progress >= 1) staticCache.set(hash, data)
+    return data
   }
   return { files: [], trackers: torrent.announce ? [...torrent.announce] : [] }
 }
@@ -276,10 +291,15 @@ async function handleLoadSaved(): Promise<void> {
         ? path.join(torrentFilesDir, `${entry.infoHash}.torrent`)
         : null
 
+      // skipVerify ONLY for completed (100%) torrents!
+      // For incomplete torrents, verification builds correct bitfield
+      // so peers know which pieces we need
+      const isCompleted = entry.progress >= 100
+
       if (torrentFile && fs.existsSync(torrentFile)) {
-        await handleAddTorrentFile({ filePath: torrentFile, savePath: entry.savePath, start: !entry.paused, skipVerify: true })
+        await handleAddTorrentFile({ filePath: torrentFile, savePath: entry.savePath, start: !entry.paused, skipVerify: isCompleted })
       } else {
-        await handleAddMagnet({ magnetURI: entry.magnetURI, savePath: entry.savePath, start: !entry.paused, skipVerify: true })
+        await handleAddMagnet({ magnetURI: entry.magnetURI, savePath: entry.savePath, start: !entry.paused, skipVerify: isCompleted })
       }
 
       if (entry.paused && entry.infoHash) pausedSet.add(entry.infoHash)
@@ -316,8 +336,8 @@ function handleAddTorrentFile(args: { filePath: string; savePath?: string; start
     if (args.start === false) opts.paused = true
 
     client.add(buffer, opts, (torrent: any) => {
-      console.log(`[Worker] Torrent ready: ${torrent.name} | ${torrent.files?.length || 0} files`)
-      setupAutoStop(torrent)
+      console.log(`[Worker] Torrent ready: ${torrent.name} | ${torrent.files?.length || 0} files | peers: ${torrent.numPeers}`)
+      setupTorrentEvents(torrent)
       if (args.start === false) pausedSet.add(torrent.infoHash)
       scheduleSave()
       resolve(getTorrentInfo(torrent))
@@ -341,8 +361,8 @@ function handleAddMagnet(args: { magnetURI: string; savePath?: string; start?: b
     if (args.start === false) opts.paused = true
 
     client.add(args.magnetURI, opts, (torrent: any) => {
-      console.log(`[Worker] Magnet ready: ${torrent.name}`)
-      setupAutoStop(torrent)
+      console.log(`[Worker] Magnet ready: ${torrent.name} | peers: ${torrent.numPeers}`)
+      setupTorrentEvents(torrent)
       if (args.start === false) pausedSet.add(torrent.infoHash)
       scheduleSave()
       resolve(getTorrentInfo(torrent))
@@ -365,39 +385,40 @@ function handleRemove(args: { infoHash: string; deleteFiles?: boolean }): void {
 function handlePause(args: { infoHash: string }): void {
   const torrent = client.torrents.find((t: any) => t.infoHash === args.infoHash)
   if (!torrent) return
+  // Per WebTorrent docs: torrent.pause() handles connections correctly
+  // DO NOT destroy wires or deselect files — breaks resume!
   torrent.pause()
-  try { torrent.files?.forEach((f: any) => f.deselect()) } catch {}
-  try { torrent.wires?.forEach((w: any) => { try { w.destroy() } catch {} }) } catch {}
   pausedSet.add(args.infoHash)
   scheduleSave()
+  console.log(`[Worker] Paused: ${torrent.name}`)
 }
 
 function handleResume(args: { infoHash: string }): void {
   const torrent = client.torrents.find((t: any) => t.infoHash === args.infoHash)
   if (!torrent) return
-  try { torrent.files?.forEach((f: any) => f.select()) } catch {}
+  // Per WebTorrent docs: torrent.resume() re-establishes connections
   torrent.resume()
   pausedSet.delete(args.infoHash)
   scheduleSave()
+  console.log(`[Worker] Resumed: ${torrent.name} | peers: ${torrent.numPeers}`)
 }
 
 function handlePauseAll(): void {
   client.torrents.forEach((t: any) => {
     t.pause()
-    try { t.files?.forEach((f: any) => f.deselect()) } catch {}
-    try { t.wires?.forEach((w: any) => { try { w.destroy() } catch {} }) } catch {}
     pausedSet.add(t.infoHash)
   })
   scheduleSave()
+  console.log(`[Worker] Paused all ${client.torrents.length} torrents`)
 }
 
 function handleResumeAll(): void {
   client.torrents.forEach((t: any) => {
-    try { t.files?.forEach((f: any) => f.select()) } catch {}
     t.resume()
     pausedSet.delete(t.infoHash)
   })
   scheduleSave()
+  console.log(`[Worker] Resumed all ${client.torrents.length} torrents`)
 }
 
 function handleThrottle(args: { infoHash: string; downLimit: number; upLimit: number }): void {
