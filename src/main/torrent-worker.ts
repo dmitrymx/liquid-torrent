@@ -48,13 +48,22 @@ const PUBLIC_TRACKERS = [
   'udp://exodus.desync.com:6969/announce',
   'udp://tracker.torrent.eu.org:451/announce',
   'udp://open.demonii.com:1337/announce',
-  'http://tracker.opentrackr.org:1337/announce'
+  'http://tracker.opentrackr.org:1337/announce',
+  'udp://explodie.org:6969/announce',
+  'udp://tracker.moeking.me:6969/announce'
+]
+
+// DHT bootstrap nodes — critical for fast peer discovery (per bittorrent-dht docs)
+const DHT_BOOTSTRAP = [
+  'router.bittorrent.com:6881',
+  'router.utorrent.com:6881',
+  'dht.transmissionbt.com:6881'
 ]
 
 const DEFAULT_SETTINGS: EngineSettings = {
   downloadDir: path.join(os.homedir(), 'Downloads'),
   maxDownloadSpeed: -1, maxUploadSpeed: -1,
-  maxConnections: 55,  // WebTorrent default per docs
+  maxConnections: 100,  // 55=default, 100=sweet spot for high-bandwidth
   port: 6881, autoStopSeeding: false,
   minimizeToTray: true, startMinimized: false,
   showNotifications: true, autoStart: false
@@ -244,6 +253,13 @@ async function handleInit(args: { dataPath: string }): Promise<void> {
     maxConns: settings.maxConnections,
     downloadLimit: settings.maxDownloadSpeed > 0 ? settings.maxDownloadSpeed : -1,
     uploadLimit: settings.maxUploadSpeed > 0 ? settings.maxUploadSpeed : -1,
+    // Per docs: all peer discovery methods enabled
+    dht: { bootstrap: DHT_BOOTSTRAP },  // Explicit bootstrap for fast DHT startup
+    tracker: true,
+    lsd: true,       // Local Service Discovery
+    utPex: true,     // Peer Exchange — peers share peers with each other
+    natUpnp: true,   // NAT-UPnP — open port for incoming connections
+    natPmp: true,    // NAT-PMP — same, different protocol
   })
   client.on('error', (err: Error) => console.error('[Worker] Client error:', err.message))
   console.log('[Worker] WebTorrent initialized')
@@ -295,7 +311,7 @@ function handleAddTorrentFile(args: { filePath: string; savePath?: string; start
       if (existing) return resolve(getTorrentInfo(existing))
     }
 
-    const opts: any = { path: dest, announce: PUBLIC_TRACKERS, storeCacheSlots: 20 }
+    const opts: any = { path: dest, announce: PUBLIC_TRACKERS }
     if (args.skipVerify) opts.skipVerify = true
     if (args.start === false) opts.paused = true
 
@@ -320,7 +336,7 @@ function handleAddMagnet(args: { magnetURI: string; savePath?: string; start?: b
       if (existing) return resolve(getTorrentInfo(existing))
     }
 
-    const opts: any = { path: dest, announce: PUBLIC_TRACKERS, storeCacheSlots: 20 }
+    const opts: any = { path: dest, announce: PUBLIC_TRACKERS }
     if (args.skipVerify) opts.skipVerify = true
     if (args.start === false) opts.paused = true
 

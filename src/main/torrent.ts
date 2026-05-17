@@ -150,7 +150,7 @@ export class TorrentEngine {
     const DEFAULT_SETTINGS: EngineSettings = {
       downloadDir: path.join(os.homedir(), 'Downloads'),
       maxDownloadSpeed: -1, maxUploadSpeed: -1,
-      maxConnections: 55, port: 6881,
+      maxConnections: 100, port: 6881,
       autoStopSeeding: false, minimizeToTray: true,
       startMinimized: false, showNotifications: true, autoStart: false
     }
