@@ -27,12 +27,15 @@ function formatETA(seconds: number): string {
 }
 
 function getStatusLabel(t: TorrentInfo): string {
+  if (t.state?.startsWith('Проверка')) return 'ПРОВЕРКА'
   if (t.paused) return 'ПАУЗА'
+  if (t.state === 'Загрузка метаданных') return 'МЕТАДАННЫЕ'
   if (t.progress >= 100) return 'РАЗДАЧА'
   return `${t.progress}%`
 }
 
 function getStatusClass(t: TorrentInfo): string {
+  if (t.state?.startsWith('Проверка')) return 'checking'
   if (t.paused) return 'paused'
   if (t.progress >= 100) return 'seeding'
   return 'downloading'
@@ -219,17 +222,20 @@ function TorrentCardInner({ torrent }: { torrent: TorrentInfo }) {
         {/* Line 2: status, speed, peers, eta */}
         <div className="tc-line2">
           <span className={`tc-status ${status}`}>{getStatusLabel(torrent)}</span>
-          {!torrent.paused && torrent.progress < 100 && (
+          {status === 'checking' && (
+            <span className="tc-speed" style={{ color: '#ff9800' }}>{torrent.state}</span>
+          )}
+          {status !== 'checking' && !torrent.paused && torrent.progress < 100 && (
             <>
               <span className="tc-speed down">↓{formatSpeed(torrent.downloadSpeed)}</span>
               <span className="tc-speed up">↑{formatSpeed(torrent.uploadSpeed)}</span>
             </>
           )}
-          {!torrent.paused && torrent.progress >= 100 && (
+          {status !== 'checking' && !torrent.paused && torrent.progress >= 100 && (
             <span className="tc-speed up">↑{formatSpeed(torrent.uploadSpeed)}</span>
           )}
           <span className="tc-peers">{torrent.numPeers}/{torrent.numSeeds} Seeds</span>
-          {torrent.progress < 100 && <span className="tc-eta">ETA: {formatETA(torrent.eta)}</span>}
+          {status !== 'checking' && torrent.progress < 100 && <span className="tc-eta">ETA: {formatETA(torrent.eta)}</span>}
         </div>
 
         {/* Progress bar */}

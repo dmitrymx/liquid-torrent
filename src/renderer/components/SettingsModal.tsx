@@ -7,6 +7,9 @@ interface SettingsData {
   maxUploadSpeed: number
   maxConnections: number
   port: number
+  activeDownloads: number
+  activeSeeds: number
+  activeLimit: number
   minimizeToTray: boolean
   startMinimized: boolean
   showNotifications: boolean
@@ -19,7 +22,10 @@ const DEFAULT_EXTRA = {
   startMinimized: false,
   showNotifications: true,
   autoStart: false,
-  autoStopSeeding: false
+  autoStopSeeding: false,
+  activeDownloads: -1,
+  activeSeeds: -1,
+  activeLimit: -1,
 }
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
@@ -54,6 +60,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   if (!settings) return null
 
+  // Convert bytes/s to KB/s for display, handle 0 = unlimited
+  const dlKB = settings.maxDownloadSpeed <= 0 ? 0 : Math.round(settings.maxDownloadSpeed / 1024)
+  const ulKB = settings.maxUploadSpeed <= 0 ? 0 : Math.round(settings.maxUploadSpeed / 1024)
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content modal-wide" onClick={e => e.stopPropagation()}>
@@ -86,20 +96,65 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               <input
                 className="modal-input"
                 type="number"
+                min="0"
                 placeholder="0 = без лимита"
-                value={settings.maxDownloadSpeed < 0 ? 0 : Math.round(settings.maxDownloadSpeed / 1024)}
+                value={dlKB}
                 onChange={e => setSettings({ ...settings, maxDownloadSpeed: Number(e.target.value) * 1024 })}
               />
+              <span className="settings-hint">0 = без ограничений</span>
             </div>
             <div className="settings-group">
               <label className="settings-label">↑ Макс. отдача (КБ/с)</label>
               <input
                 className="modal-input"
                 type="number"
+                min="0"
                 placeholder="0 = без лимита"
-                value={settings.maxUploadSpeed < 0 ? 0 : Math.round(settings.maxUploadSpeed / 1024)}
+                value={ulKB}
                 onChange={e => setSettings({ ...settings, maxUploadSpeed: Number(e.target.value) * 1024 })}
               />
+              <span className="settings-hint">0 = без ограничений</span>
+            </div>
+          </div>
+
+          {/* Queueing */}
+          <div className="settings-section-title">Очередь</div>
+          <div className="settings-row-3">
+            <div className="settings-group">
+              <label className="settings-label">Актив. загрузки</label>
+              <input
+                className="modal-input"
+                type="number"
+                min="-1"
+                placeholder="-1 = ∞"
+                value={settings.activeDownloads}
+                onChange={e => setSettings({ ...settings, activeDownloads: Number(e.target.value) })}
+              />
+              <span className="settings-hint">-1 = без лимита</span>
+            </div>
+            <div className="settings-group">
+              <label className="settings-label">Актив. раздачи</label>
+              <input
+                className="modal-input"
+                type="number"
+                min="-1"
+                placeholder="-1 = ∞"
+                value={settings.activeSeeds}
+                onChange={e => setSettings({ ...settings, activeSeeds: Number(e.target.value) })}
+              />
+              <span className="settings-hint">-1 = без лимита</span>
+            </div>
+            <div className="settings-group">
+              <label className="settings-label">Актив. всего</label>
+              <input
+                className="modal-input"
+                type="number"
+                min="-1"
+                placeholder="-1 = ∞"
+                value={settings.activeLimit}
+                onChange={e => setSettings({ ...settings, activeLimit: Number(e.target.value) })}
+              />
+              <span className="settings-hint">-1 = без лимита</span>
             </div>
           </div>
 

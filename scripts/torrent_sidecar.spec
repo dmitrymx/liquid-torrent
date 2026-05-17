@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['d:\\1AntigravityProjects\\torrentlite-electron\\scripts\\torrent_sidecar.py'],
+    ['D:\\1AntigravityProjects\\torrentlite-electron\\scripts\\torrent_sidecar.py'],
     pathex=[],
     binaries=[],
     datas=[],

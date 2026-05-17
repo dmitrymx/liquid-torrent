@@ -48,10 +48,13 @@ class SidecarEngine:
     def _load_settings(self) -> dict:
         defaults = {
             "downloadDir": os.path.expanduser("~/Downloads"),
-            "maxDownloadSpeed": -1,
-            "maxUploadSpeed": -1,
-            "maxConnections": 200,
+            "maxDownloadSpeed": 0,
+            "maxUploadSpeed": 0,
+            "maxConnections": 500,
             "port": 6881,
+            "activeDownloads": -1,
+            "activeSeeds": -1,
+            "activeLimit": -1,
         }
         try:
             if os.path.exists(self._settings_path):
@@ -60,6 +63,11 @@ class SidecarEngine:
                 defaults.update(saved)
         except Exception:
             pass
+        # Migrate old -1 speed limits to 0 (unlimited)
+        if defaults.get("maxDownloadSpeed", 0) == -1:
+            defaults["maxDownloadSpeed"] = 0
+        if defaults.get("maxUploadSpeed", 0) == -1:
+            defaults["maxUploadSpeed"] = 0
         return defaults
 
     def _save_settings(self):
@@ -74,31 +82,50 @@ class SidecarEngine:
         s = self._settings
         port = s.get("port", 6881)
         pack = {
-            "user_agent": "LiquidTorrent/1.3",
-            "listen_interfaces": f"0.0.0.0:{port}",
+            # ── Identity ──
+            "user_agent": "LiquidTorrent/1.4",
+            "listen_interfaces": f"0.0.0.0:{port},[::0]:{port}",
             "alert_mask": (
                 lt.alert.category_t.status_notification
                 | lt.alert.category_t.error_notification
                 | lt.alert.category_t.storage_notification
             ),
+            # ── Trackers / DHT / LSD ──
             "announce_to_all_tiers": True,
             "announce_to_all_trackers": True,
-            "connections_limit": s.get("maxConnections", 200),
-            "allow_multiple_connections_per_ip": True,
             "enable_dht": True,
             "enable_lsd": True,
             "enable_upnp": True,
             "enable_natpmp": True,
+            "dht_bootstrap_nodes": "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881",
+            # ── Connection limits (qBittorrent-like) ──
+            "connections_limit": s.get("maxConnections", 500),
+            "allow_multiple_connections_per_ip": True,
+            # ── Queuing: disable auto-queuing limits → all torrents active ──
+            # (mirrors qBittorrent with queuing disabled: -1 = unlimited)
+            "active_downloads": s.get("activeDownloads", -1),
+            "active_seeds": s.get("activeSeeds", -1),
+            "active_limit": s.get("activeLimit", -1),
+            "active_tracker_limit": -1,
+            "active_dht_limit": -1,
+            "active_lsd_limit": -1,
+            # ── Performance (matched from qBittorrent defaults) ──
+            "send_buffer_watermark": 500 * 1024,      # 500 KB
+            "send_buffer_low_watermark": 10 * 1024,    # 10 KB
+            "send_buffer_watermark_factor": 50,
+            "choking_algorithm": 0,                    # fixed_slots_choker
+            "seed_choking_algorithm": 1,                # fastest_upload
+            "mixed_mode_algorithm": 0,                  # prefer_tcp
+            "piece_extent_affinity": True,
+            # ── Protocols ──
+            "enable_incoming_tcp": True,
+            "enable_outgoing_tcp": True,
+            "enable_incoming_utp": True,
+            "enable_outgoing_utp": True,
+            # ── Rate limits (0 = unlimited per libtorrent spec) ──
+            "download_rate_limit": s.get("maxDownloadSpeed", 0),
+            "upload_rate_limit": s.get("maxUploadSpeed", 0),
         }
-        dl = s.get("maxDownloadSpeed", -1)
-        ul = s.get("maxUploadSpeed", -1)
-        if dl > 0:
-            pack["download_rate_limit"] = dl
-        if ul > 0:
-            pack["upload_rate_limit"] = ul
-
-        # DHT bootstrap via settings (libtorrent 2.0+ API)
-        pack["dht_bootstrap_nodes"] = "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881"
 
         self.session.apply_settings(pack)
 
@@ -163,8 +190,12 @@ class SidecarEngine:
             info["infoHash"] = tid
             info["name"] = status.name if status.name else "Загрузка метаданных..."
             info["savePath"] = os.path.join(status.save_path, status.name or "")
-            info["paused"] = status.paused
-            info["progress"] = round(status.total_wanted_done * 100 / status.total_wanted) if status.total_wanted > 0 else 0
+            info["paused"] = bool(status.paused)
+            # For checking state, show check progress instead of download progress
+            if status.state in (lt.torrent_status.checking_files, lt.torrent_status.checking_resume_data):
+                info["progress"] = round(status.progress * 100)
+            else:
+                info["progress"] = round(status.total_wanted_done * 100 / status.total_wanted) if status.total_wanted > 0 else 0
             info["downloadSpeed"] = status.download_rate
             info["uploadSpeed"] = status.upload_rate
             info["size"] = status.total_wanted
@@ -174,19 +205,20 @@ class SidecarEngine:
             info["numSeeds"] = status.num_seeds
             info["ratio"] = (status.total_upload / status.total_download) if status.total_download > 0 else 0
 
-            # State
-            if status.paused:
+            # State — check libtorrent state first, then paused flag
+            # (checking_files/checking_resume_data should show even if paused flag is set)
+            if status.state == lt.torrent_status.checking_files:
+                state = f"Проверка файлов ({round(status.progress * 100)}%)"
+            elif status.state == lt.torrent_status.checking_resume_data:
+                state = "Проверка resume data..."
+            elif status.paused:
                 state = "Приостановлено"
-            elif status.state == lt.torrent_status.checking_files:
-                state = "Проверка файлов"
             elif status.state == lt.torrent_status.downloading_metadata:
                 state = "Загрузка метаданных"
             elif status.state == lt.torrent_status.downloading:
                 state = "Загрузка"
             elif status.state in (lt.torrent_status.finished, lt.torrent_status.seeding):
                 state = "Раздача" if status.upload_rate > 0 else "Завершено"
-            elif status.state == lt.torrent_status.checking_resume_data:
-                state = "Проверка данных"
             else:
                 state = "Загрузка"
             info["state"] = state
@@ -247,9 +279,12 @@ class SidecarEngine:
                             params = lt.read_resume_data(rd)
                             params.save_path = save_path
                             if paused:
+                                # qBittorrent pattern: paused + NOT auto_managed = stays paused
                                 params.flags |= lt.torrent_flags.paused
+                                params.flags &= ~lt.torrent_flags.auto_managed
                             else:
                                 params.flags &= ~lt.torrent_flags.paused
+                                params.flags |= lt.torrent_flags.auto_managed
                             h = self.session.add_torrent(params)
                             self.torrents[str(h.info_hash())] = h
                             continue
@@ -279,8 +314,12 @@ class SidecarEngine:
         ti = lt.torrent_info(lt.bdecode(data))
         params = {"ti": ti, "save_path": sp}
         if not start:
+            # Set paused flag for initial add
             params["flags"] = lt.torrent_flags.paused
         h = self.session.add_torrent(params)
+        if not start:
+            # qBittorrent pattern: unset auto_managed so libtorrent won't auto-resume
+            h.unset_flags(lt.torrent_flags.auto_managed)
         tid = str(h.info_hash())
         with self._lock:
             self.torrents[tid] = h
@@ -303,6 +342,9 @@ class SidecarEngine:
         if not start:
             params.flags |= lt.torrent_flags.paused
         h = self.session.add_torrent(params)
+        if not start:
+            # qBittorrent pattern: unset auto_managed so libtorrent won't auto-resume
+            h.unset_flags(lt.torrent_flags.auto_managed)
         tid = str(h.info_hash())
         with self._lock:
             self.torrents[tid] = h
@@ -329,27 +371,32 @@ class SidecarEngine:
     def pause(self, info_hash: str):
         h = self.torrents.get(info_hash)
         if h and h.is_valid():
+            # qBittorrent pattern: unset auto_managed THEN pause
+            # Without this, libtorrent auto-resumes the torrent within 30s!
+            h.unset_flags(lt.torrent_flags.auto_managed)
             h.pause()
 
     def resume(self, info_hash: str):
         h = self.torrents.get(info_hash)
         if h and h.is_valid():
+            # qBittorrent pattern: set auto_managed THEN resume
+            h.set_flags(lt.torrent_flags.auto_managed)
             h.resume()
 
     def pause_all(self):
-        # Iterate per-torrent so status.paused updates correctly for UI
         with self._lock:
             items = list(self.torrents.values())
         for h in items:
             if h.is_valid():
+                h.unset_flags(lt.torrent_flags.auto_managed)
                 h.pause()
 
     def resume_all(self):
-        # Iterate per-torrent so status.paused updates correctly for UI
         with self._lock:
             items = list(self.torrents.values())
         for h in items:
             if h.is_valid():
+                h.set_flags(lt.torrent_flags.auto_managed)
                 h.resume()
 
     def throttle(self, info_hash: str, down_limit: int, up_limit: int):
@@ -370,6 +417,12 @@ class SidecarEngine:
             pack["upload_rate_limit"] = v if v > 0 else 0
         if "maxConnections" in new_settings:
             pack["connections_limit"] = new_settings["maxConnections"]
+        if "activeDownloads" in new_settings:
+            pack["active_downloads"] = new_settings["activeDownloads"]
+        if "activeSeeds" in new_settings:
+            pack["active_seeds"] = new_settings["activeSeeds"]
+        if "activeLimit" in new_settings:
+            pack["active_limit"] = new_settings["activeLimit"]
         if pack:
             self.session.apply_settings(pack)
         self._save_settings()

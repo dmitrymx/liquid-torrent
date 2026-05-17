@@ -47,6 +47,9 @@ export interface EngineSettings {
   maxUploadSpeed: number
   maxConnections: number
   port: number
+  activeDownloads?: number
+  activeSeeds?: number
+  activeLimit?: number
   autoStopSeeding?: boolean
   minimizeToTray?: boolean
   startMinimized?: boolean
