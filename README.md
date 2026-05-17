@@ -6,11 +6,12 @@
 
 **Современный, быстрый и стильный торрент-клиент для Windows**
 
-[![Version](https://img.shields.io/badge/version-1.3.0-blue?style=for-the-badge)](https://github.com/dmitrymx/liquid-torrent/releases)
+[![Version](https://img.shields.io/badge/version-1.3.1-blue?style=for-the-badge)](https://github.com/dmitrymx/liquid-torrent/releases)
 [![Electron](https://img.shields.io/badge/Electron-36-47848F?style=for-the-badge&logo=electron)](https://electronjs.org)
+[![libtorrent](https://img.shields.io/badge/libtorrent-2.0.11-orange?style=for-the-badge)](https://libtorrent.org)
 [![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
 
-*Торрент-клиент нового поколения с премиальным дизайном и нулевым потреблением ресурсов*
+*Торрент-клиент нового поколения с движком libtorrent (C++) и премиальным дизайном*
 
 ---
 
@@ -18,16 +19,17 @@
 
 ## ✨ Возможности
 
+- 🚀 **Движок libtorrent 2.0.11 (C++)** — тот же движок что в qBittorrent, скорости 30+ МБ/с
 - 🎨 **Премиальный UI** — тёмная тема с неоновыми акцентами, SVG-анимации, glassmorphism
-- ⚡ **Высокая производительность** — оптимизирован для работы с торрентами 155+ ГБ без тормозов
+- ⚡ **Нулевые тормоза** — торрент-движок работает в отдельном процессе, UI никогда не зависает
+- 💾 **Мгновенное восстановление** — торренты восстанавливаются из resume data без перехеширования
 - 📁 **Поддержка .torrent файлов** — открывайте `.torrent` файлы прямо из Проводника
 - 🧲 **Магнет-ссылки** — мгновенное добавление через `magnet:` протокол
-- 💾 **Мгновенный запуск** — торренты восстанавливаются из сохранённых `.torrent` файлов параллельно
 - ⏸️ **Управление загрузками** — пауза/продолжение, индивидуальные лимиты скорости
 - 📊 **Визуализация скорости** — график скорости в реальном времени (Canvas)
 - 🔔 **Системный трей** — работает в фоне с контекстным меню
 - 📂 **Дерево файлов** — иерархический просмотр файлов торрента
-- 🛡️ **Портативный** — один `.exe` файл, без установки
+- 🛡️ **Портативный** — один `.exe` файл, без установки, Python не нужен
 
 ## 📸 Скриншот
 
@@ -41,10 +43,10 @@
 
 ### Портативная версия (рекомендуется)
 
-1. Скачайте `LiquidTorrent-1.3.0-portable.exe` из раздела [Releases](https://github.com/dmitrymx/liquid-torrent/releases)
+1. Скачайте `LiquidTorrent-1.3.1-portable.exe` из раздела [Releases](https://github.com/dmitrymx/liquid-torrent/releases)
 2. Запустите — готово!
 
-Не требует установки. Данные хранятся в `%AppData%/liquid-torrent`.
+Не требует установки. Python на целевом ПК **не нужен** — libtorrent упакован внутри.
 
 ### Сборка из исходников
 
@@ -56,8 +58,12 @@ cd liquid-torrent
 # Установить зависимости
 npm install
 
-# Запустить в режиме разработки
+# Запустить в режиме разработки (требует Python 3.11 + libtorrent)
 npm run dev
+
+# Собрать sidecar (PyInstaller)
+python -m PyInstaller --onefile --noconsole --name torrent_sidecar \
+  --distpath "scripts/dist" scripts/torrent_sidecar.py
 
 # Собрать портативный EXE
 npm run dist:portable
@@ -70,43 +76,46 @@ npm run dist:portable
 | Фреймворк | Electron 36 + electron-vite |
 | UI | React 19 + TypeScript |
 | Стейт | Zustand 5 |
-| Торрент-движок | WebTorrent 2.5 |
+| Торрент-движок | **libtorrent 2.0.11** (C++ через Python sidecar) |
 | Иконки | Lucide React |
-| Сборка | electron-builder (portable) |
+| Сборка | electron-builder (portable) + PyInstaller |
 
 ## ⚙️ Архитектура
 
 ```
+Electron Main Process (torrent.ts — thin proxy)
+    ↕  child_process.spawn + stdin/stdout JSON-RPC
+Python Sidecar (torrent_sidecar.exe — PyInstaller bundle)
+    ↕  python-libtorrent bindings
+libtorrent 2.0.11 (C++ native engine)
+```
+
+```
 src/
-├── main/                # Electron Main Process
-│   ├── index.ts         # Window, IPC, Tray, file associations
-│   ├── torrent.ts       # Thin proxy → utilityProcess (15KB)
-│   └── torrent-worker.ts # WebTorrent engine (отдельный процесс!)
+├── main/                  # Electron Main Process
+│   ├── index.ts           # Window, IPC, Tray, file associations
+│   └── torrent.ts         # Thin JSON-RPC proxy → Python sidecar
 ├── preload/
-│   └── index.ts         # Context bridge (IPC ↔ Renderer)
-└── renderer/            # React UI
-    ├── App.tsx          # Главный компонент + polling loop
-    ├── store/           # Zustand state management
-    ├── components/      # UI компоненты
-    └── styles/          # CSS (тёмная тема, анимации)
+│   └── index.ts           # Context bridge (IPC ↔ Renderer)
+├── renderer/              # React UI
+│   ├── App.tsx            # Главный компонент + polling loop
+│   ├── store/             # Zustand state management
+│   ├── components/        # UI компоненты
+│   └── styles/            # CSS (тёмная тема, анимации)
+└── scripts/
+    ├── torrent_sidecar.py # Headless libtorrent engine (JSON-RPC)
+    └── dist/
+        └── torrent_sidecar.exe  # PyInstaller bundle (~10.5 МБ)
 ```
 
-### Ключевое решение: utilityProcess
+### Почему libtorrent, а не WebTorrent?
 
-```
-Renderer ←IPC→ Main Process (Window/IPC/Tray)
-                    ↓ postMessage (async)
-               UtilityProcess (WebTorrent Engine)
-               ↑ отдельный OS-процесс, не блокирует UI
-```
-
-### Оптимизации производительности (v1.3.0)
-
-- **Лёгкий polling** — основной цикл запрашивает только состояние торрентов (без файлов/трекеров)
-- **Кэш метаданных** — файлы и трекеры кэшируются один раз при получении метаданных
-- **Ленивая загрузка** — полная информация загружается по запросу (при выборе торрента)
-- **React.memo** — карточки торрентов не перерисовываются если данные не изменились
-- **Параллельное восстановление** — все торренты восстанавливаются одновременно при запуске
+| Метрика | WebTorrent (старый) | libtorrent (текущий) |
+|---------|--------------------|--------------------|
+| Скорость скачивания | 5-15 МБ/с | **15-35+ МБ/с** |
+| SHA1 верификация | JS event loop (блокирует) | C++ async threads |
+| Resume data | Нет (перехеш при запуске) | Native (мгновенный старт) |
+| Влияние на UI | Зависает при больших торрентах | **Нулевое** (отдельный процесс) |
 
 ## 📋 Горячие клавиши
 

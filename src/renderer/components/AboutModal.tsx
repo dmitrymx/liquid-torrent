@@ -18,7 +18,7 @@ export function AboutModal({ onClose }: { onClose: () => void }) {
         </div>
 
         <div className="about-app-name">Liquid Torrent</div>
-        <div className="about-version">v{typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.3.0'}</div>
+        <div className="about-version">v{typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.3.1'}</div>
 
         <div className="about-divider" />
 
