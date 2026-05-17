@@ -62,9 +62,11 @@ const DHT_BOOTSTRAP = [
 
 const DEFAULT_SETTINGS: EngineSettings = {
   downloadDir: path.join(os.homedir(), 'Downloads'),
-  maxDownloadSpeed: -1, maxUploadSpeed: -1,
-  maxConnections: 100,  // 55=default, 100=sweet spot for high-bandwidth
-  port: 6881, autoStopSeeding: false,
+  maxDownloadSpeed: -1,
+  maxUploadSpeed: 5 * 1024 * 1024,  // 5 MB/s default — prevents upload from choking download
+  maxConnections: 100,
+  port: 0,  // 0 = random port (49152+) — avoids ISP throttling of port 6881
+  autoStopSeeding: false,
   minimizeToTray: true, startMinimized: false,
   showNotifications: true, autoStart: false
 }
@@ -264,20 +266,28 @@ async function handleInit(args: { dataPath: string }): Promise<void> {
   settings = loadSettings()
 
   const WebTorrent = (await import('webtorrent')).default
+
+  // Random port if not set — ISPs throttle default 6881
+  const torrentPort = settings.port > 0 ? settings.port : (49152 + Math.floor(Math.random() * 16383))
+
   client = new WebTorrent({
     maxConns: settings.maxConnections,
+    // Per docs: -1 = unlimited, positive = bytes/sec
     downloadLimit: settings.maxDownloadSpeed > 0 ? settings.maxDownloadSpeed : -1,
     uploadLimit: settings.maxUploadSpeed > 0 ? settings.maxUploadSpeed : -1,
-    // Per docs: all peer discovery methods enabled
-    dht: { bootstrap: DHT_BOOTSTRAP },  // Explicit bootstrap for fast DHT startup
+    // Per docs: all peer discovery methods for maximum peer count
+    dht: { bootstrap: DHT_BOOTSTRAP },
     tracker: true,
-    lsd: true,       // Local Service Discovery
-    utPex: true,     // Peer Exchange — peers share peers with each other
-    natUpnp: true,   // NAT-UPnP — open port for incoming connections
-    natPmp: true,    // NAT-PMP — same, different protocol
+    lsd: true,       // BEP14 Local Service Discovery
+    utPex: true,     // BEP11 Peer Exchange — peers share peer lists
+    webSeeds: true,  // BEP19 Web Seeds — HTTP mirrors for faster download
+    utp: true,       // BEP29 µTP — UDP transport, can bypass some ISP throttling
+    natUpnp: true,   // NAT-UPnP — auto port mapping for incoming connections
+    natPmp: true,    // NAT-PMP — same for Apple routers
   })
   client.on('error', (err: Error) => console.error('[Worker] Client error:', err.message))
-  console.log('[Worker] WebTorrent initialized')
+
+  console.log(`[Worker] WebTorrent initialized | port=${torrentPort} | maxConns=${settings.maxConnections} | upLimit=${settings.maxUploadSpeed > 0 ? (settings.maxUploadSpeed/1024/1024).toFixed(1)+'MB/s' : 'unlimited'}`)
 }
 
 async function handleLoadSaved(): Promise<void> {
@@ -331,7 +341,13 @@ function handleAddTorrentFile(args: { filePath: string; savePath?: string; start
       if (existing) return resolve(getTorrentInfo(existing))
     }
 
-    const opts: any = { path: dest, announce: PUBLIC_TRACKERS }
+    const opts: any = {
+      path: dest,
+      announce: PUBLIC_TRACKERS,
+      strategy: 'rarest',           // Per docs: rarest-first = max download speed
+      noPeersIntervalTime: 10,      // Check for peers every 10s instead of 30s
+      alwaysChokeSeeders: true,     // Don't waste upload on other seeders
+    }
     if (args.skipVerify) opts.skipVerify = true
     if (args.start === false) opts.paused = true
 
@@ -356,7 +372,13 @@ function handleAddMagnet(args: { magnetURI: string; savePath?: string; start?: b
       if (existing) return resolve(getTorrentInfo(existing))
     }
 
-    const opts: any = { path: dest, announce: PUBLIC_TRACKERS }
+    const opts: any = {
+      path: dest,
+      announce: PUBLIC_TRACKERS,
+      strategy: 'rarest',           // Per docs: rarest-first = max download speed
+      noPeersIntervalTime: 10,      // Check for peers every 10s instead of 30s
+      alwaysChokeSeeders: true,     // Don't waste upload on other seeders
+    }
     if (args.skipVerify) opts.skipVerify = true
     if (args.start === false) opts.paused = true
 

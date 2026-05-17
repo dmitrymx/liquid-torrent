@@ -115,19 +115,21 @@ export class TorrentEngine {
   }
 
   /** Send a message to the worker and wait for response */
-  private send(action: string, args?: any): Promise<any> {
+  private send(action: string, args?: any, timeoutMs?: number): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = `msg_${++this.msgId}_${Date.now()}`
       this.pendingRequests.set(id, { resolve, reject })
       this.worker.postMessage({ id, action, args })
 
-      // Timeout after 30s (for long operations like loadSaved)
+      // Operation-specific timeouts:
+      // loadSaved/addTorrentFile may verify 155GB+ → needs minutes
+      const timeout = timeoutMs ?? 30000
       setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id)
           reject(new Error(`Timeout: ${action}`))
         }
-      }, 30000)
+      }, timeout)
     })
   }
 
@@ -149,8 +151,9 @@ export class TorrentEngine {
   private loadSettings(): EngineSettings {
     const DEFAULT_SETTINGS: EngineSettings = {
       downloadDir: path.join(os.homedir(), 'Downloads'),
-      maxDownloadSpeed: -1, maxUploadSpeed: -1,
-      maxConnections: 100, port: 6881,
+      maxDownloadSpeed: -1,
+      maxUploadSpeed: 5 * 1024 * 1024,  // 5 MB/s default — prevents upload from saturating upstream
+      maxConnections: 100, port: 0,  // 0 = random port, avoids ISP throttle
       autoStopSeeding: false, minimizeToTray: true,
       startMinimized: false, showNotifications: true, autoStart: false
     }
@@ -176,15 +179,16 @@ export class TorrentEngine {
   // ─── Torrent Operations (delegated to worker) ──────────────
 
   async loadSavedTorrents(): Promise<void> {
-    await this.send('loadSaved')
+    // 155GB+ torrent verification can take 5+ minutes
+    await this.send('loadSaved', undefined, 600000)
   }
 
   async addTorrentFile(filePath: string, savePath?: string, start = true): Promise<TorrentInfo> {
-    return this.send('addTorrentFile', { filePath, savePath, start })
+    return this.send('addTorrentFile', { filePath, savePath, start }, 300000)
   }
 
   async addMagnet(magnetURI: string, savePath?: string, start = true): Promise<TorrentInfo> {
-    return this.send('addMagnet', { magnetURI, savePath, start })
+    return this.send('addMagnet', { magnetURI, savePath, start }, 300000)
   }
 
   removeTorrent(infoHash: string, deleteFiles = false): void {
