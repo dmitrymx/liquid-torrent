@@ -1,6 +1,6 @@
 {
   "name": "liquid-torrent",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Liquid Torrent — Premium Torrent Client by DmitryMX",
   "main": "./out/main/index.js",
   "author": "Максимов Д.А. <@dmitrymx>",

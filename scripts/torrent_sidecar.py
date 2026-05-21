@@ -176,6 +176,10 @@ class SidecarEngine:
                     if h.is_valid():
                         try:
                             h.save_resume_data()
+                            send_event("torrent_finished", {
+                                "infoHash": str(h.info_hash()),
+                                "name": h.status().name
+                            })
                         except Exception:
                             pass
             except Exception:
@@ -196,13 +200,19 @@ class SidecarEngine:
                 info["progress"] = round(status.progress * 100)
             else:
                 info["progress"] = round(status.total_wanted_done * 100 / status.total_wanted) if status.total_wanted > 0 else 0
-            info["downloadSpeed"] = status.download_rate
-            info["uploadSpeed"] = status.upload_rate
+            if status.paused:
+                info["downloadSpeed"] = 0
+                info["uploadSpeed"] = 0
+                info["numPeers"] = 0
+                info["numSeeds"] = 0
+            else:
+                info["downloadSpeed"] = status.download_rate
+                info["uploadSpeed"] = status.upload_rate
+                info["numPeers"] = status.num_peers
+                info["numSeeds"] = status.num_seeds
             info["size"] = status.total_wanted
             info["totalDownload"] = status.total_download
             info["totalUpload"] = status.total_upload
-            info["numPeers"] = status.num_peers
-            info["numSeeds"] = status.num_seeds
             info["ratio"] = (status.total_upload / status.total_download) if status.total_download > 0 else 0
 
             # State — check libtorrent state first, then paused flag
@@ -233,26 +243,41 @@ class SidecarEngine:
                 info["magnetURI"] = ""
 
             # Static info (cached once)
-            if handle.has_metadata() and tid not in self._static_cached:
+            if status.has_metadata and tid not in self._static_cached:
                 ti = handle.get_torrent_info()
                 info["creationDate"] = datetime.datetime.fromtimestamp(ti.creation_date()).isoformat() if ti.creation_date() > 0 else None
                 info["comment"] = ti.comment() if ti.comment() else None
                 files = []
                 fs = ti.files()
+                fp = handle.file_progress(lt.file_progress_flags_t.piece_granularity)
                 for i in range(ti.num_files()):
-                    fp = handle.file_progress()
                     files.append({
                         "index": i,
                         "path": fs.file_path(i),
                         "name": os.path.basename(fs.file_path(i)),
                         "size": fs.file_size(i),
-                        "progress": round(fp[i] * 100 / fs.file_size(i)) if fs.file_size(i) > 0 else 0,
+                        "progress": round(fp[i] * 100 / fs.file_size(i)) if fs.file_size(i) > 0 and i < len(fp) else 0,
                     })
                 info["files"] = files
                 info["trackers"] = [t.url for t in ti.trackers()]
                 self._static_cached.add(tid)
 
-            self.info_cache[tid] = info
+            # Update file progress and priority dynamically if metadata exists
+            if status.has_metadata:
+                if tid in self._static_cached and "files" in info:
+                    try:
+                        fp = handle.file_progress(lt.file_progress_flags_t.piece_granularity)
+                        prio = handle.file_priorities()
+                        for f in info["files"]:
+                            idx = f["index"]
+                            sz = f["size"]
+                            f["progress"] = round(fp[idx] * 100 / sz) if sz > 0 and idx < len(fp) else 0
+                            f["priority"] = prio[idx] if idx < len(prio) else 4
+                    except Exception as e:
+                        log(f"Dynamic files update error: {e}")
+
+            with self._lock:
+                self.info_cache[tid] = info
         except Exception as e:
             log(f"Update info error for {tid}: {e}")
 
@@ -286,7 +311,8 @@ class SidecarEngine:
                                 params.flags &= ~lt.torrent_flags.paused
                                 params.flags |= lt.torrent_flags.auto_managed
                             h = self.session.add_torrent(params)
-                            self.torrents[str(h.info_hash())] = h
+                            with self._lock:
+                                self.torrents[str(h.info_hash())] = h
                             continue
                         except Exception:
                             pass
@@ -306,13 +332,15 @@ class SidecarEngine:
         except Exception as e:
             log(f"Load saved error: {e}")
 
-    def add_torrent_file(self, file_path: str, save_path: str = None, start: bool = True) -> dict:
+    def add_torrent_file(self, file_path: str, save_path: str = None, start: bool = True, file_priorities: list = None) -> dict:
         sp = save_path or self._settings["downloadDir"]
         os.makedirs(sp, exist_ok=True)
         with open(file_path, "rb") as f:
             data = f.read()
         ti = lt.torrent_info(lt.bdecode(data))
         params = {"ti": ti, "save_path": sp}
+        if file_priorities is not None:
+            params["file_priorities"] = [4 if p > 0 else 0 for p in file_priorities]
         if not start:
             # Set paused flag for initial add
             params["flags"] = lt.torrent_flags.paused
@@ -333,6 +361,44 @@ class SidecarEngine:
         self._save_torrents()
         self._update_info(tid, h)
         return self.info_cache.get(tid, {"id": tid, "infoHash": tid})
+
+    def parse_torrent_file(self, file_path: str) -> dict:
+        try:
+            try:
+                ti = lt.torrent_info(file_path)
+            except Exception:
+                with open(file_path, "rb") as f:
+                    data = f.read()
+                ti = lt.torrent_info(lt.bdecode(data))
+            
+            files = []
+            fs = ti.files()
+            for i in range(ti.num_files()):
+                files.append({
+                    "i": i,
+                    "p": fs.file_path(i),
+                    "s": fs.file_size(i)
+                })
+            return {
+                "name": ti.name(),
+                "infoHash": str(ti.info_hash()),
+                "size": ti.total_size(),
+                "files": files
+            }
+        except Exception as e:
+            raise Exception(f"Не удалось разобрать торрент-файл: {e}")
+
+    def prioritize_files(self, info_hash: str, priorities: list):
+        with self._lock:
+            h = self.torrents.get(info_hash)
+        if not h or not h.is_valid():
+            raise Exception("Торрент не найден")
+        lt_priorities = [4 if p > 0 else 0 for p in priorities]
+        h.prioritize_files(lt_priorities)
+        try:
+            h.save_resume_data()
+        except Exception:
+            pass
 
     def add_magnet(self, uri: str, save_path: str = None, start: bool = True) -> dict:
         sp = save_path or self._settings["downloadDir"]
@@ -432,25 +498,32 @@ class SidecarEngine:
 
     def get_all_light(self) -> list:
         result = []
-        for tid in list(self.info_cache.keys()):
-            info = dict(self.info_cache[tid])
-            info.pop("files", None)
-            info.pop("trackers", None)
-            result.append(info)
+        with self._lock:
+            cached_items = list(self.info_cache.values())
+        for info in cached_items:
+            info_copy = dict(info)
+            info_copy.pop("files", None)
+            info_copy.pop("trackers", None)
+            result.append(info_copy)
         return result
 
     def get_full_info(self, info_hash: str) -> Optional[dict]:
-        return self.info_cache.get(info_hash)
+        with self._lock:
+            return self.info_cache.get(info_hash)
 
     def get_all_torrents(self) -> list:
-        return list(self.info_cache.values())
+        with self._lock:
+            return list(self.info_cache.values())
 
     def get_session_stats(self) -> dict:
         # libtorrent 2.0+: session.status() is deprecated, aggregate from torrents
         dl_rate = 0
         ul_rate = 0
         peers = 0
-        for info in self.info_cache.values():
+        with self._lock:
+            cached_items = list(self.info_cache.values())
+            num_torrents = len(self.torrents)
+        for info in cached_items:
             dl_rate += info.get("downloadSpeed", 0)
             ul_rate += info.get("uploadSpeed", 0)
             peers += info.get("numPeers", 0)
@@ -458,7 +531,7 @@ class SidecarEngine:
             "downloadRate": dl_rate,
             "uploadRate": ul_rate,
             "numPeers": peers,
-            "numTorrents": len(self.torrents),
+            "numTorrents": num_torrents,
         }
 
     # ─── Persistence ───────────────────────────────────────
@@ -492,7 +565,7 @@ class SidecarEngine:
         with self._lock:
             items = list(self.torrents.items())
         for tid, h in items:
-            if h.is_valid() and h.has_metadata():
+            if h.is_valid() and h.status().has_metadata:
                 try:
                     h.save_resume_data()
                 except Exception:
@@ -531,6 +604,11 @@ def respond(msg_id: str, result=None, error=None):
     sys.stdout.write(json.dumps(resp, ensure_ascii=False, default=str) + "\n")
     sys.stdout.flush()
 
+def send_event(event_name: str, data: dict):
+    resp = {"event": event_name, "data": data}
+    sys.stdout.write(json.dumps(resp, ensure_ascii=False, default=str) + "\n")
+    sys.stdout.flush()
+
 def handle_message(msg: dict):
     msg_id = msg.get("id", "0")
     action = msg.get("action", "")
@@ -544,11 +622,17 @@ def handle_message(msg: dict):
             engine.load_saved()
             respond(msg_id, None)
         elif action == "addTorrentFile":
-            r = engine.add_torrent_file(args["filePath"], args.get("savePath"), args.get("start", True))
+            r = engine.add_torrent_file(args["filePath"], args.get("savePath"), args.get("start", True), args.get("filePriorities"))
             respond(msg_id, r)
         elif action == "addMagnet":
             r = engine.add_magnet(args["magnetURI"], args.get("savePath"), args.get("start", True))
             respond(msg_id, r)
+        elif action == "parseTorrentFile":
+            r = engine.parse_torrent_file(args["filePath"])
+            respond(msg_id, r)
+        elif action == "prioritizeFiles":
+            engine.prioritize_files(args["infoHash"], args["priorities"])
+            respond(msg_id, None)
         elif action == "remove":
             engine.remove(args["infoHash"], args.get("deleteFiles", False))
             respond(msg_id, None)

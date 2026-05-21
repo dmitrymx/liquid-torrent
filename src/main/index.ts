@@ -4,8 +4,10 @@
  */
 import { app, BrowserWindow, ipcMain, dialog, Tray, Menu, shell } from 'electron'
 import { join } from 'path'
+import * as path from 'path'
 import { TorrentEngine } from './torrent'
 import * as fs from 'fs'
+import { exec, execSync } from 'child_process'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -19,7 +21,58 @@ if (!gotLock) {
 }
 
 // File associations: .torrent and magnet:
-app.setAsDefaultProtocolClient('magnet')
+const exePath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath
+app.setAsDefaultProtocolClient('magnet', exePath)
+
+function registerFileAssociation(): void {
+  if (process.platform !== 'win32') return
+  const exePath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath
+  const exeName = path.basename(exePath)
+  
+  const commands = [
+    `reg add "HKCU\\Software\\Classes\\.torrent" /ve /t REG_SZ /d "LiquidTorrent" /f`,
+    `reg add "HKCU\\Software\\Classes\\LiquidTorrent" /ve /t REG_SZ /d "Torrent File" /f`,
+    `reg add "HKCU\\Software\\Classes\\LiquidTorrent\\DefaultIcon" /ve /t REG_SZ /d "\\"${exePath}\\",0" /f`,
+    `reg add "HKCU\\Software\\Classes\\LiquidTorrent\\shell\\open\\command" /ve /t REG_SZ /d "\\"${exePath}\\" \\"%1\\"" /f`,
+    `reg add "HKCU\\Software\\Classes\\Applications\\${exeName}" /ve /t REG_SZ /d "Liquid Torrent" /f`,
+    `reg add "HKCU\\Software\\Classes\\Applications\\${exeName}\\shell\\open\\command" /ve /t REG_SZ /d "\\"${exePath}\\" \\"%1\\"" /f`,
+    `reg add "HKCU\\Software\\LiquidTorrent\\Capabilities\\FileAssociations" /v ".torrent" /t REG_SZ /d "LiquidTorrent" /f`,
+    `reg add "HKCU\\Software\\RegisteredApplications" /v "Liquid Torrent" /t REG_SZ /d "Software\\LiquidTorrent\\Capabilities" /f`
+  ]
+
+  commands.forEach(cmd => {
+    exec(cmd, (err) => {
+      if (err) console.error('[Registry] Error running command:', cmd, err)
+    })
+  })
+}
+
+function getDiskSpace(dirPath: string): Promise<{ free: number; total: number }> {
+  return new Promise((resolve) => {
+    try {
+      const resolvedPath = path.resolve(dirPath)
+      const driveLetter = resolvedPath.split(':')[0]
+      if (driveLetter && driveLetter.length === 1) {
+        // Run PowerShell asynchronously to prevent blocking the main process
+        exec(`powershell -Command "(Get-PSDrive ${driveLetter}).Free; (Get-PSDrive ${driveLetter}).Used + (Get-PSDrive ${driveLetter}).Free"`, { windowsHide: true }, (err, stdout) => {
+          if (err) {
+            console.error('[System] Error getting disk space:', err)
+            return resolve({ free: -1, total: -1 })
+          }
+          const lines = stdout.trim().split(/[\r\n]+/)
+          const free = parseInt(lines[0]) || -1
+          const total = parseInt(lines[1]) || -1
+          resolve({ free, total })
+        })
+      } else {
+        resolve({ free: -1, total: -1 })
+      }
+    } catch (e) {
+      console.error('[System] Error getting disk space:', e)
+      resolve({ free: -1, total: -1 })
+    }
+  })
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -96,9 +149,19 @@ function setupIPC(): void {
   ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
 
   // Torrent operations — all wrapped in try/catch
-  ipcMain.handle('torrent:addFile', async (_e, filePath: string, savePath?: string) => {
-    try { return await engine.addTorrentFile(filePath, savePath) }
+  ipcMain.handle('torrent:addFile', async (_e, filePath: string, savePath?: string, start?: boolean, filePriorities?: number[]) => {
+    try { return await engine.addTorrentFile(filePath, savePath, start, filePriorities) }
     catch (err: any) { console.error('[IPC] addFile:', err); return null }
+  })
+
+  ipcMain.handle('torrent:parseFile', async (_e, filePath: string) => {
+    try { return await engine.parseTorrentFile(filePath) }
+    catch (err: any) { console.error('[IPC] parseFile:', err); return null }
+  })
+
+  ipcMain.handle('torrent:prioritizeFiles', (_e, infoHash: string, priorities: number[]) => {
+    try { engine.prioritizeFiles(infoHash, priorities) }
+    catch (err: any) { console.error('[IPC] prioritizeFiles:', err) }
   })
 
   ipcMain.handle('torrent:addMagnet', async (_e, magnetURI: string, savePath?: string) => {
@@ -203,8 +266,8 @@ function setupIPC(): void {
   })
 
   // Disk free space
-  ipcMain.handle('system:freeSpace', async () => {
-    return { free: -1, total: -1 }
+  ipcMain.handle('system:freeSpace', async (_e, dirPath: string) => {
+    return getDiskSpace(dirPath || engine.getSettings().downloadDir)
   })
 }
 
@@ -230,6 +293,7 @@ app.on('open-file', (_e, filePath) => {
 })
 
 app.whenReady().then(async () => {
+  registerFileAssociation()
   engine = new TorrentEngine()
   await engine.init()  // async: starts Python libtorrent sidecar
   setupIPC()

@@ -6,7 +6,7 @@
 
 **Современный, быстрый и стильный торрент-клиент для Windows**
 
-[![Version](https://img.shields.io/badge/version-1.4.0-blue?style=for-the-badge)](https://github.com/dmitrymx/liquid-torrent/releases)
+[![Version](https://img.shields.io/badge/version-1.5.0-blue?style=for-the-badge)](https://github.com/dmitrymx/liquid-torrent/releases)
 [![Electron](https://img.shields.io/badge/Electron-36-47848F?style=for-the-badge&logo=electron)](https://electronjs.org)
 [![libtorrent](https://img.shields.io/badge/libtorrent-2.0.11-orange?style=for-the-badge)](https://libtorrent.org)
 [![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
@@ -43,7 +43,7 @@
 
 ### Портативная версия (рекомендуется)
 
-1. Скачайте `LiquidTorrent-1.3.1-portable.exe` из раздела [Releases](https://github.com/dmitrymx/liquid-torrent/releases)
+1. Скачайте `LiquidTorrent-1.5.0-portable.exe` из раздела [Releases](https://github.com/dmitrymx/liquid-torrent/releases)
 2. Запустите — готово!
 
 Не требует установки. Python на целевом ПК **не нужен** — libtorrent упакован внутри.

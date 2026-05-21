@@ -10,7 +10,9 @@ declare global {
       maximize: () => void
       close: () => void
       isMaximized: () => Promise<boolean>
-      addTorrentFile: (filePath: string, savePath?: string) => Promise<any>
+      addTorrentFile: (filePath: string, savePath?: string, start?: boolean, filePriorities?: number[]) => Promise<any>
+      parseTorrentFile: (filePath: string) => Promise<any>
+      prioritizeFiles: (infoHash: string, priorities: number[]) => Promise<void>
       addMagnet: (magnetURI: string, savePath?: string) => Promise<any>
       removeTorrent: (infoHash: string, deleteFiles: boolean) => Promise<void>
       pauseTorrent: (infoHash: string) => Promise<void>
@@ -28,7 +30,7 @@ declare global {
       chooseDirDialog: () => Promise<string | null>
       openPath: (p: string) => Promise<void>
       openExternal: (url: string) => void
-      getFreeSpace: () => Promise<{ free: number; total: number }>
+      getFreeSpace: (dirPath?: string) => Promise<{ free: number; total: number }>
     }
   }
 }
@@ -48,7 +50,7 @@ export interface TorrentInfo {
   numSeeds: number
   eta: number
   savePath: string
-  files?: { index: number; path: string; name: string; size: number; progress: number }[]
+  files?: { index: number; path: string; name: string; size: number; progress: number; priority?: number }[]
   trackers?: string[]
   magnetURI: string
   infoHash: string

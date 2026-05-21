@@ -12,8 +12,12 @@ const electronAPI = {
   isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
 
   // Torrent operations
-  addTorrentFile: (filePath: string, savePath?: string) =>
-    ipcRenderer.invoke('torrent:addFile', filePath, savePath),
+  addTorrentFile: (filePath: string, savePath?: string, start?: boolean, filePriorities?: number[]) =>
+    ipcRenderer.invoke('torrent:addFile', filePath, savePath, start, filePriorities),
+  parseTorrentFile: (filePath: string) =>
+    ipcRenderer.invoke('torrent:parseFile', filePath),
+  prioritizeFiles: (infoHash: string, priorities: number[]) =>
+    ipcRenderer.invoke('torrent:prioritizeFiles', infoHash, priorities),
   addMagnet: (magnetURI: string, savePath?: string) =>
     ipcRenderer.invoke('torrent:addMagnet', magnetURI, savePath),
   removeTorrent: (infoHash: string, deleteFiles: boolean) =>
@@ -44,7 +48,7 @@ const electronAPI = {
   openExternal: (url: string) => ipcRenderer.send('open:external', url),
 
   // System
-  getFreeSpace: () => ipcRenderer.invoke('system:freeSpace')
+  getFreeSpace: (dirPath?: string) => ipcRenderer.invoke('system:freeSpace', dirPath)
 }
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI)

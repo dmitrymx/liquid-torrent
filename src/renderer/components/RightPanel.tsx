@@ -24,46 +24,105 @@ interface FileNode {
   name: string
   size: number
   progress: number
-  children?: Record<string, FileNode>
   isDir: boolean
+  children?: Record<string, FileNode>
+  index?: number
+  priority?: number
+  fileIndices?: number[]
+  checked?: boolean
+  indeterminate?: boolean
 }
 
-function buildFileTree(files: { path: string; name: string; size: number; progress: number }[]): FileNode {
-  const root: FileNode = { name: '', size: 0, isDir: true, children: {}, progress: 0 }
+function buildFileTree(files: { index: number; path: string; name: string; size: number; progress: number; priority?: number }[]): FileNode {
+  const root: FileNode = { name: '', size: 0, isDir: true, children: {}, progress: 0, fileIndices: [] }
 
   for (const f of files) {
     const filePath = (f.path || f.name).replace(/\\/g, '/') 
     const parts = filePath.split('/')
     let node = root
+    node.fileIndices?.push(f.index)
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i]
       if (!node.children) node.children = {}
       if (i === parts.length - 1) {
         // leaf file
-        node.children[part] = { name: part, size: f.size, progress: f.progress, isDir: false }
+        node.children[part] = { name: part, size: f.size, progress: f.progress, isDir: false, index: f.index, priority: f.priority ?? 4 }
       } else {
         if (!node.children[part]) {
-          node.children[part] = { name: part, size: 0, isDir: true, children: {}, progress: 0 }
+          node.children[part] = { name: part, size: 0, isDir: true, children: {}, progress: 0, fileIndices: [] }
         }
         node = node.children[part]
+        node.fileIndices?.push(f.index)
       }
     }
   }
 
-  // Compute folder sizes
-  function computeSize(n: FileNode): number {
-    if (!n.isDir || !n.children) return n.size
-    let total = 0
-    for (const c of Object.values(n.children)) total += computeSize(c)
-    n.size = total
-    return total
+  // Compute folder stats
+  function computeStats(n: FileNode): { size: number; downloaded: number; checkedCount: number; uncheckedCount: number; indetCount: number } {
+    if (!n.isDir) {
+      const isChecked = n.priority !== 0
+      n.checked = isChecked
+      n.indeterminate = false
+      return {
+        size: n.size,
+        downloaded: isChecked ? (n.progress / 100) * n.size : 0,
+        checkedCount: isChecked ? 1 : 0,
+        uncheckedCount: isChecked ? 0 : 1,
+        indetCount: 0
+      }
+    }
+    let totalSize = 0
+    let totalDownloaded = 0
+    let totalChecked = 0
+    let totalUnchecked = 0
+    let totalIndet = 0
+    if (n.children) {
+      for (const c of Object.values(n.children)) {
+        const stats = computeStats(c)
+        totalSize += stats.size
+        totalDownloaded += stats.downloaded
+        totalChecked += stats.checkedCount
+        totalUnchecked += stats.uncheckedCount
+        totalIndet += stats.indetCount
+      }
+    }
+    n.size = totalSize
+    n.progress = totalSize > 0 ? Math.round((totalDownloaded / totalSize) * 100) : 0
+
+    const totalItems = totalChecked + totalUnchecked + totalIndet
+    if (totalChecked === totalItems && totalItems > 0) {
+      n.checked = true
+      n.indeterminate = false
+    } else if (totalChecked > 0 || totalIndet > 0) {
+      n.checked = false
+      n.indeterminate = true
+    } else {
+      n.checked = false
+      n.indeterminate = false
+    }
+
+    return {
+      size: totalSize,
+      downloaded: totalDownloaded,
+      checkedCount: n.checked ? 1 : 0,
+      uncheckedCount: (!n.checked && !n.indeterminate) ? 1 : 0,
+      indetCount: n.indeterminate ? 1 : 0
+    }
   }
-  computeSize(root)
+  computeStats(root)
 
   return root
 }
 
-function FileTreeNode({ node, depth = 0 }: { node: FileNode; depth?: number }) {
+function FileTreeNode({
+  node,
+  depth = 0,
+  onPrioritize
+}: {
+  node: FileNode
+  depth?: number
+  onPrioritize: (fileIndices: number[], priority: number) => void
+}) {
   const [open, setOpen] = useState(depth < 1)
 
   if (node.isDir && node.children) {
@@ -71,6 +130,16 @@ function FileTreeNode({ node, depth = 0 }: { node: FileNode; depth?: number }) {
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
       return a.name.localeCompare(b.name)
     })
+
+    const indices = node.fileIndices || []
+    const isChecked = !!node.checked
+    const isSomeChecked = !!node.indeterminate
+
+    const handleFolderCheckClick = (e: React.MouseEvent) => {
+      e.stopPropagation()
+      const nextPriority = (isChecked || isSomeChecked) ? 0 : 4
+      onPrioritize(indices, nextPriority)
+    }
 
     return (
       <div>
@@ -83,26 +152,61 @@ function FileTreeNode({ node, depth = 0 }: { node: FileNode; depth?: number }) {
             <span className="file-tree-arrow">
               {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
             </span>
+            <div
+              className={`tree-checkbox ${isChecked ? 'checked' : ''} ${isSomeChecked ? 'indeterminate' : ''}`}
+              onClick={handleFolderCheckClick}
+            />
             <Folder size={13} style={{ color: '#ffab40', flexShrink: 0 }} />
             <span className="file-tree-name">{node.name}</span>
-            <span className="file-tree-size">{formatSize(node.size)}</span>
+            <span className="file-tree-size">
+              {formatSize(node.size)}
+              {node.progress > 0 && node.progress < 100 && (
+                <span style={{ fontSize: 10, color: 'var(--accent-blue)', marginLeft: 6 }}>
+                  ({node.progress}%)
+                </span>
+              )}
+            </span>
           </div>
         )}
         {(open || !node.name) && entries.map((child, i) => (
-          <FileTreeNode key={child.name + i} node={child} depth={node.name ? depth + 1 : 0} />
+          <FileTreeNode
+            key={child.name + i}
+            node={child}
+            depth={node.name ? depth + 1 : 0}
+            onPrioritize={onPrioritize}
+          />
         ))}
       </div>
     )
   }
 
+  const fileIdx = node.index ?? 0
+  const isChecked = !!node.checked
+
+  const handleFileCheckClick = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    onPrioritize([fileIdx], isChecked ? 0 : 4)
+  }
+
   return (
-    <div className="file-tree-row" style={{ paddingLeft: depth * 12 }}>
+    <div className="file-tree-row" style={{ paddingLeft: depth * 12 }} onClick={handleFileCheckClick}>
       <span className="file-tree-arrow" style={{ visibility: 'hidden' }}>
         <ChevronRight size={12} />
       </span>
+      <div
+        className={`tree-checkbox ${isChecked ? 'checked' : ''}`}
+        onClick={handleFileCheckClick}
+      />
       <FileText size={13} style={{ color: '#6b7280', flexShrink: 0 }} />
-      <span className="file-tree-name">{node.name}</span>
-      <span className="file-tree-size">{formatSize(node.size)}</span>
+      <span className="file-tree-name" style={{ opacity: isChecked ? 1 : 0.4 }}>{node.name}</span>
+      <span className="file-tree-size">
+        {formatSize(node.size)}
+        {isChecked && node.progress > 0 && (
+          <span style={{ fontSize: 10, color: 'var(--accent-green)', marginLeft: 6 }}>
+            ({node.progress}%)
+          </span>
+        )}
+      </span>
     </div>
   )
 }
@@ -307,8 +411,8 @@ export function RightPanel() {
 
   useEffect(() => {
     if (!selectedId) { setFullInfo(null); setFullInfoHash(null); return }
-    // Only fetch when viewing files or trackers tab, or when selected torrent changes
-    if (rightTab !== 'files' && rightTab !== 'trackers' && fullInfoHash === selectedId) return
+    if (rightTab !== 'files' && rightTab !== 'trackers') return
+    if (fullInfoHash === selectedId) return
 
     let cancelled = false
     const fetchFull = async () => {
@@ -335,6 +439,32 @@ export function RightPanel() {
     if (!fullInfo?.files?.length) return null
     return buildFileTree(fullInfo.files)
   }, [fullInfo?.files])
+
+  const handlePrioritize = (fileIndices: number[], priority: number) => {
+    if (!selectedId || !fullInfo?.files) return
+    const indexSet = new Set(fileIndices)
+    const updatedPriorities = fullInfo.files.map((file: any) => {
+      if (indexSet.has(file.index)) {
+        return priority
+      }
+      return file.priority ?? 4
+    })
+    window.electronAPI.prioritizeFiles(selectedId, updatedPriorities)
+
+    // Optimistically update local fullInfo state
+    setFullInfo((prev: any) => {
+      if (!prev || !prev.files) return prev
+      return {
+        ...prev,
+        files: prev.files.map((file: any) => {
+          if (indexSet.has(file.index)) {
+            return { ...file, priority }
+          }
+          return file
+        })
+      }
+    })
+  }
 
   return (
     <div className="right-panel">
@@ -406,7 +536,7 @@ export function RightPanel() {
             </div>
             {fileTree ? (
               <div className="file-tree">
-                <FileTreeNode node={fileTree} />
+                <FileTreeNode node={fileTree} onPrioritize={handlePrioritize} />
               </div>
             ) : (
               <div style={{ fontSize: 11, color: '#6b7280', padding: '8px 0' }}>

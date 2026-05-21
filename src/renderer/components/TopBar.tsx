@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { useTorrentStore } from '../store/useTorrentStore'
 import { Plus, Link, Play, PauseIcon, Trash2, Search } from 'lucide-react'
+import AddTorrentModal from './AddTorrentModal'
 
 export function TopBar() {
   const searchQuery = useTorrentStore(s => s.searchQuery)
@@ -10,14 +11,24 @@ export function TopBar() {
 
   const [showMagnetModal, setShowMagnetModal] = useState(false)
   const [magnetInput, setMagnetInput] = useState('')
+  const [torrentFileToAdd, setTorrentFileToAdd] = useState<string | null>(null)
 
   const handleAddFile = async () => {
     try {
       const files = await window.electronAPI.openTorrentDialog()
       if (files?.length) {
-        for (const f of files) await window.electronAPI.addTorrentFile(f)
+        setTorrentFileToAdd(files[0])
       }
     } catch {}
+  }
+
+  const handleConfirmAddFile = async (filePath: string, savePath: string, start: boolean, filePriorities: number[]) => {
+    try {
+      await window.electronAPI.addTorrentFile(filePath, savePath, start, filePriorities)
+      setTorrentFileToAdd(null)
+    } catch (err) {
+      console.error('[TopBar] Failed to add torrent file:', err)
+    }
   }
 
   const handleAddMagnet = async () => {
@@ -100,6 +111,14 @@ export function TopBar() {
             </div>
           </div>
         </div>
+      )}
+
+      {torrentFileToAdd && (
+        <AddTorrentModal
+          filePath={torrentFileToAdd}
+          onClose={() => setTorrentFileToAdd(null)}
+          onAdd={handleConfirmAddFile}
+        />
       )}
     </>
   )

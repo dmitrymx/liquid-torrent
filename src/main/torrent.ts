@@ -107,6 +107,10 @@ export class TorrentEngine {
     this.rl.on('line', (line: string) => {
       try {
         const data = JSON.parse(line)
+        if (data.event) {
+          this.handleSidecarEvent(data.event, data.data)
+          return
+        }
         const pending = this.pendingRequests.get(data.id)
         if (pending) {
           this.pendingRequests.delete(data.id)
@@ -141,6 +145,21 @@ export class TorrentEngine {
     await this.send('init', { dataPath: this.dataPath })
     this._ready = true
     console.log('[TorrentEngine] libtorrent sidecar initialized!')
+  }
+
+  private handleSidecarEvent(event: string, data: any): void {
+    if (event === 'torrent_finished') {
+      if (this.settings.showNotifications) {
+        import('electron').then(({ Notification }) => {
+          const notif = new Notification({
+            title: 'Скачивание завершено! 🎉',
+            body: `Торрент "${data.name}" успешно скачан.`,
+            icon: path.join(__dirname, '../../resources/icon.png')
+          })
+          notif.show()
+        }).catch(console.error)
+      }
+    }
   }
 
   /** Find the sidecar executable or script */
@@ -247,8 +266,34 @@ export class TorrentEngine {
     await this.send('loadSaved', undefined, 600000)
   }
 
-  async addTorrentFile(filePath: string, savePath?: string, start = true): Promise<TorrentInfo> {
-    return this.send('addTorrentFile', { filePath, savePath, start }, 300000)
+  async addTorrentFile(filePath: string, savePath?: string, start = true, filePriorities?: number[]): Promise<TorrentInfo> {
+    return this.send('addTorrentFile', { filePath, savePath, start, filePriorities }, 300000)
+  }
+
+  async parseTorrentFile(filePath: string): Promise<any> {
+    const raw = await this.send('parseTorrentFile', { filePath }, 60000)
+    if (!raw || !raw.files) return raw
+    return {
+      name: raw.name,
+      infoHash: raw.infoHash,
+      size: raw.size,
+      files: raw.files.map((f: any) => {
+        const p = f.p || ''
+        const lastSlash = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
+        return {
+          index: f.i,
+          path: p,
+          name: lastSlash !== -1 ? p.substring(lastSlash + 1) : p,
+          size: f.s,
+          progress: 0,
+          priority: 4
+        }
+      })
+    }
+  }
+
+  prioritizeFiles(infoHash: string, priorities: number[]): void {
+    this.sendNoWait('prioritizeFiles', { infoHash, priorities })
   }
 
   async addMagnet(magnetURI: string, savePath?: string, start = true): Promise<TorrentInfo> {
