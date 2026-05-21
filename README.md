@@ -35,7 +35,7 @@
 
 <div align="center">
 
-*Скриншот приложения будет добавлен позже*
+<img src="screen.png" width="800" alt="Liquid Torrent Screenshot" />
 
 </div>
 
